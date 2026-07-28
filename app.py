@@ -20,7 +20,6 @@ FRONT_THRESHOLD = st.sidebar.slider("Front (저자 항목별) 매칭 기준", 0.
 BACK_THRESHOLD = st.sidebar.slider("Back (참고문헌) 매칭 기준", 0.0, 1.0, 0.65, 0.05) 
 
 def get_similarity(text1, text2):
-    """두 문자열 간의 유사도를 0.0 ~ 1.0 사이로 반환 (공백/줄바꿈 무시)"""
     if not text1 or not text2:
         return 0.0
     t1 = text1.replace(" ", "").replace("\n", "").strip()
@@ -28,19 +27,16 @@ def get_similarity(text1, text2):
     return difflib.SequenceMatcher(None, t1, t2).ratio()
 
 def extract_xml_text(element):
-    """XML 엘리먼트 내의 모든 텍스트를 재귀적으로 추출"""
     if element is None:
         return ""
     return "".join(element.itertext()).strip()
 
 def get_raw_xml(element):
-    """XML 엘리먼트를 원시 문자열로 변환"""
     if element is None:
         return ""
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
 def find_best_match(xml_text, pdf_texts):
-    """전체 문서 텍스트 중 최고 유사도, 바운딩 박스, 페이지 번호 반환"""
     best_match_ratio, best_bbox, best_page = 0, None, -1
     for pdf_item in pdf_texts:
         ratio = get_similarity(xml_text, pdf_item["text"])
@@ -69,21 +65,29 @@ if uploaded_pdf and uploaded_xml:
 
     doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
     
-    # 세션 상태를 활용한 페이지 네비게이션 제어
-    if "pdf_page" not in st.session_state:
-        st.session_state.pdf_page = 0
+    # --- [상태 관리(Session State) 수정 부분] ---
+    # 위젯 key와 내부 상태 변수(target_page)를 분리하여 동기화
+    if "target_page" not in st.session_state:
+        st.session_state.target_page = 0
         
+    def sync_page():
+        """사이드바 넘버 인풋이 변경될 때 상태 업데이트"""
+        st.session_state.target_page = st.session_state.pdf_page_input
+
     st.sidebar.header("네비게이션")
     st.sidebar.number_input(
         f"페이지 번호 (0 ~ {len(doc)-1})", 
         min_value=0, 
         max_value=len(doc)-1, 
-        key="pdf_page" # 세션 상태 변수와 위젯 연동
+        value=st.session_state.target_page, # 초기값은 내부 상태로 지정
+        key="pdf_page_input",               # 위젯 전용 고유 키
+        on_change=sync_page                 # 값 변경 시 콜백 실행
     )
-    page_num = st.session_state.pdf_page
+    
+    page_num = st.session_state.target_page
     page = doc[page_num]
     
-    # 1. PDF 전체 문서 텍스트 블록 및 좌표 추출 (페이지 정보 포함)
+    # 1. PDF 전체 문서 텍스트 추출
     extracted_pdf_texts = []
     for p_num in range(len(doc)):
         p_blocks = doc[p_num].get_text("dict")["blocks"]
@@ -102,13 +106,12 @@ if uploaded_pdf and uploaded_xml:
     unmapped_xml_back = []
     
     # ==========================================
-    # [Front - 저자 정보 상세 항목 매칭]
+    # [Front - 저자 정보 상세 매칭]
     # ==========================================
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
             
-            # 1. 이름 (name) 매칭 로직
             for name_node in contrib.findall('.//name'):
                 surname = extract_xml_text(name_node.find('surname'))
                 given = extract_xml_text(name_node.find('given-names'))
@@ -142,7 +145,6 @@ if uploaded_pdf and uploaded_xml:
                     })
                     unmapped_xml_front.append(get_raw_xml(name_node))
 
-            # 2. 이메일, 3. ORCID, 4. 역할 매칭
             for email_node in contrib.findall('.//email'):
                 xml_text = extract_xml_text(email_node)
                 if not xml_text: continue
@@ -174,7 +176,7 @@ if uploaded_pdf and uploaded_xml:
                     unmapped_xml_front.append(get_raw_xml(role_node))
 
     # ==========================================
-    # [Back - 참고문헌 영역 찾기 및 다중 블록 병합 매칭]
+    # [Back - 참고문헌 다중 블록 매칭]
     # ==========================================
     ref_start_idx = 0
     for i, item in enumerate(extracted_pdf_texts):
@@ -255,17 +257,19 @@ if uploaded_pdf and uploaded_xml:
             st.subheader("📊 영역별 매칭 데이터 (Front & Back)")
             tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (미구현)", "Back (참고문헌)"])
             
-            # [기능 추가] 선택 시 페이지 자동 이동 로직 적용
             with tab_front:
                 if not df.empty and "Front" in df["category"].values:
                     df_front = df[df["category"] == "Front"].reset_index(drop=True)
                     event_front = st.dataframe(df_front, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_f")
                     if len(event_front.selection.rows) > 0:
                         selected_row_data = df_front.iloc[event_front.selection.rows[0]].to_dict()
-                        # 매핑 성공이고, 현재 페이지와 선택된 데이터의 페이지가 다르면 페이지 이동
-                        if selected_row_data['bbox'] != "None" and selected_row_data['page'] != st.session_state.pdf_page:
-                            st.session_state.pdf_page = int(selected_row_data['page'])
-                            st.rerun()
+                        
+                        # --- 페이지 자동 이동 로직 (Front) ---
+                        if selected_row_data['bbox'] != "None":
+                            target_p = int(selected_row_data['page'])
+                            if target_p != st.session_state.target_page:
+                                st.session_state.target_page = target_p
+                                st.rerun()
                         
             with tab_body:
                 st.info("Body 영역 매칭 로직은 아직 적용되지 않았습니다.")
@@ -276,10 +280,13 @@ if uploaded_pdf and uploaded_xml:
                     event_back = st.dataframe(df_back, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_b")
                     if len(event_back.selection.rows) > 0 and selected_row_data is None:
                         selected_row_data = df_back.iloc[event_back.selection.rows[0]].to_dict()
-                        # 매핑 성공이고, 현재 페이지와 선택된 데이터의 페이지가 다르면 페이지 이동
-                        if selected_row_data['bbox'] != "None" and selected_row_data['page'] != st.session_state.pdf_page:
-                            st.session_state.pdf_page = int(selected_row_data['page'])
-                            st.rerun()
+                        
+                        # --- 페이지 자동 이동 로직 (Back) ---
+                        if selected_row_data['bbox'] != "None":
+                            target_p = int(selected_row_data['page'])
+                            if target_p != st.session_state.target_page:
+                                st.session_state.target_page = target_p
+                                st.rerun()
                 
             st.markdown("<br>##### 📌 선택된 추출 정보 전체 데이터", unsafe_allow_html=True)
             with st.container(height=200):
@@ -310,8 +317,7 @@ if uploaded_pdf and uploaded_xml:
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             draw = ImageDraw.Draw(img)
             
-            # 선택된 행의 'page' 값이 현재 좌측에 렌더링된 'page_num'과 일치할 때만 바운딩 박스를 그림
-            if selected_row_data and selected_row_data.get('bbox') != "None" and selected_row_data.get('page') == page_num:
+            if selected_row_data and selected_row_data.get('bbox') != "None" and int(selected_row_data.get('page')) == page_num:
                 try:
                     bbox = ast.literal_eval(selected_row_data['bbox'])
                     scaled_bbox = [b * zoom for b in bbox]
