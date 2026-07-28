@@ -306,7 +306,7 @@ if uploaded_pdf and uploaded_xml:
                 unmapped_xml_back.append(get_raw_xml(ref))
 
     # ==========================================
-    # [데이터프레임 생성 및 PDF 좌표 기준 정렬 로직 적용]
+    # [데이터 정렬 로직 (1단/2단 읽기 흐름 반영)]
     # ==========================================
     df = pd.DataFrame(mapped_data)
     
@@ -319,18 +319,25 @@ if uploaded_pdf and uploaded_xml:
             try:
                 bbox = ast.literal_eval(bbox_str)
                 x0, y0, x1, y1 = bbox
-                # 250px 단위로 묶어 단(Column)을 나눔 (1단/2단 모두 포괄 처리)
-                col = int(x0 // 250)
+                
+                width = x1 - x0
+                # A4 용지 기준 중앙(약 300px)을 좌우 단으로 나누는 임계값으로 설정
+                # 가운데 정렬된 제목이나 넓은 텍스트(width > 250)는 무조건 우선(col=0) 배정
+                if width > 250 or x0 < 300:
+                    col = 0
+                else:
+                    col = 1
+                    
                 return page, col, y0
             except:
                 return page, 9999, 9999
 
-        # 정렬용 보조 키 생성
+        # 정렬용 임시 컬럼 생성
         df['sort_page'] = df.apply(lambda x: get_sort_keys(x)[0], axis=1)
         df['sort_col']  = df.apply(lambda x: get_sort_keys(x)[1], axis=1)
         df['sort_y0']   = df.apply(lambda x: get_sort_keys(x)[2], axis=1)
         
-        # 페이지 -> 단(가로) -> 세로 순서대로 정렬 후 보조 키 삭제
+        # 페이지 -> 단(가로) -> 세로 위치 순으로 정렬
         df = df.sort_values(by=['sort_page', 'sort_col', 'sort_y0'])
         df = df.drop(columns=['sort_page', 'sort_col', 'sort_y0']).reset_index(drop=True)
 
