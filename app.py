@@ -11,7 +11,7 @@ import difflib
 # 설정 및 헬퍼 함수
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="JATS XML-PDF 라벨링 검수 툴")
-st.title("JATS XML - PDF 저자 정보 매칭 및 검수 도구")
+st.title("JATS XML - PDF 저자 및 참고문헌 매칭 검수 도구")
 st.markdown("XML 데이터를 기준으로 PDF 텍스트와 유사도를 비교하여 바운딩 박스를 추출합니다.")
 
 def get_similarity(text1, text2):
@@ -30,7 +30,6 @@ def get_raw_xml(element):
     """XML 엘리먼트를 원시 문자열로 변환"""
     if element is None:
         return ""
-    # 유니코드 디코딩 시 발생할 수 있는 에러 방지
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
 # ---------------------------------------------------------
@@ -46,7 +45,7 @@ if uploaded_pdf and uploaded_xml:
     try:
         tree = ET.parse(uploaded_xml)
         root = tree.getroot()
-        st.success("✅ 파일이 성공적으로 로드되었습니다. Front(저자 정보) 매칭을 시작합니다.")
+        st.success("✅ 파일이 성공적으로 로드되었습니다. 매칭 작업을 시작합니다.")
     except Exception as e:
         st.error(f"❌ XML 파싱 오류: {e}")
         st.stop()
@@ -65,19 +64,19 @@ if uploaded_pdf and uploaded_xml:
             block_text = "".join([span["text"] for line in b["lines"] for span in line["spans"]])
             extracted_pdf_texts.append({"text": block_text, "bbox": b["bbox"]})
 
-    # 2. XML Front 영역 저자(contrib) 정보 파싱 및 매칭
+    # 2. XML Front & Back 영역 파싱 및 매칭
     mapped_data = []
     unmapped_xml_front = []
+    unmapped_xml_back = []
     
+    # [Front - 저자 정보 매칭]
     front_node = root.find('.//front')
     if front_node is not None:
-        # 저자 정보(contrib) 추출
         for contrib in front_node.findall('.//contrib'):
             xml_text = extract_xml_text(contrib)
             if not xml_text:
                 continue
                 
-            # PDF 블록들과 유사도 비교
             best_match_ratio = 0
             best_bbox = None
             
@@ -87,12 +86,11 @@ if uploaded_pdf and uploaded_xml:
                     best_match_ratio = ratio
                     best_bbox = pdf_item["bbox"]
             
-            # 임계치(예: 70%) 이상일 경우 매핑 성공으로 간주
-            SIMILARITY_THRESHOLD = 0.7
-            if best_match_ratio >= SIMILARITY_THRESHOLD:
+            FRONT_THRESHOLD = 0.7
+            if best_match_ratio >= FRONT_THRESHOLD:
                 mapped_data.append({
                     "category": "Front",
-                    "tag": "contrib (저자)",
+                    "tag": "contrib",
                     "xml_text": xml_text,
                     "page": page_num,
                     "bbox": str([round(c, 2) for c in best_bbox]),
@@ -102,15 +100,59 @@ if uploaded_pdf and uploaded_xml:
             else:
                 mapped_data.append({
                     "category": "Front",
-                    "tag": "contrib (저자)",
+                    "tag": "contrib",
                     "xml_text": xml_text,
                     "page": page_num,
                     "bbox": "None",
                     "similarity": f"{best_match_ratio * 100:.1f}%",
                     "status": "❌ 매핑 실패"
                 })
-                # 매핑 실패한 XML 노드는 미처리 목록에 추가
                 unmapped_xml_front.append(get_raw_xml(contrib))
+
+    # [Back - 참고문헌 매칭]
+    back_node = root.find('.//back')
+    if back_node is not None:
+        # JATS 구조상 참고문헌은 ref 태그 하위의 annotation 등에 위치
+        for ref in back_node.findall('.//ref'):
+            annotation = ref.find('.//annotation')
+            if annotation is None:
+                continue
+                
+            xml_text = extract_xml_text(annotation)
+            if not xml_text:
+                continue
+                
+            best_match_ratio = 0
+            best_bbox = None
+            
+            for pdf_item in extracted_pdf_texts:
+                ratio = get_similarity(xml_text, pdf_item["text"])
+                if ratio > best_match_ratio:
+                    best_match_ratio = ratio
+                    best_bbox = pdf_item["bbox"]
+            
+            BACK_THRESHOLD = 0.95
+            if best_match_ratio >= BACK_THRESHOLD:
+                mapped_data.append({
+                    "category": "Back",
+                    "tag": "annotation",
+                    "xml_text": xml_text,
+                    "page": page_num,
+                    "bbox": str([round(c, 2) for c in best_bbox]),
+                    "similarity": f"{best_match_ratio * 100:.1f}%",
+                    "status": "✅ 매칭 완료"
+                })
+            else:
+                mapped_data.append({
+                    "category": "Back",
+                    "tag": "annotation",
+                    "xml_text": xml_text,
+                    "page": page_num,
+                    "bbox": "None",
+                    "similarity": f"{best_match_ratio * 100:.1f}%",
+                    "status": "❌ 매핑 실패"
+                })
+                unmapped_xml_back.append(get_raw_xml(ref))
 
     df = pd.DataFrame(mapped_data)
     selected_row_data = None
@@ -120,24 +162,34 @@ if uploaded_pdf and uploaded_xml:
     col_img, col_data = st.columns([5, 5])
     
     with col_data:
-        st.subheader("📊 Front 영역 매칭 데이터 (저자 정보 중심)")
-        st.caption("XML의 저자 텍스트를 기준으로 PDF 텍스트와 유사도를 비교하여 좌표를 찾습니다.")
+        st.subheader("📊 영역별 매칭 데이터 (Front & Back)")
         
-        # 상단: 데이터 테이블 렌더링 및 선택 이벤트 캡처
-        if not df.empty:
-            event = st.dataframe(
-                df,
-                use_container_width=True,
-                height=200,
-                on_select="rerun",
-                selection_mode="single-row"
-            )
+        tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (미구현)", "Back (참고문헌)"])
+        
+        # Front 탭 렌더링
+        with tab_front:
+            if not df.empty and "Front" in df["category"].values:
+                df_front = df[df["category"] == "Front"].reset_index(drop=True)
+                event_front = st.dataframe(df_front, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row")
+                if len(event_front.selection.rows) > 0:
+                    selected_row_data = df_front.iloc[event_front.selection.rows[0]].to_dict()
+            else:
+                st.info("매핑된 Front 데이터가 없습니다.")
+                
+        # Body 탭 렌더링
+        with tab_body:
+            st.info("Body 영역 매칭 로직은 아직 적용되지 않았습니다.")
             
-            if len(event.selection.rows) > 0:
-                selected_idx = event.selection.rows[0]
-                selected_row_data = df.iloc[selected_idx].to_dict()
-        else:
-            st.warning("현재 페이지에서 매핑된 Front(저자) 정보가 없습니다.")
+        # Back 탭 렌더링
+        with tab_back:
+            if not df.empty and "Back" in df["category"].values:
+                df_back = df[df["category"] == "Back"].reset_index(drop=True)
+                event_back = st.dataframe(df_back, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row")
+                # Front 탭에서 선택된 것이 없을 때만 Back 탭의 선택을 반영
+                if len(event_back.selection.rows) > 0 and selected_row_data is None:
+                    selected_row_data = df_back.iloc[event_back.selection.rows[0]].to_dict()
+            else:
+                st.info("매핑된 Back 데이터가 없습니다.")
             
         # 하단: 선택된 행의 전체 JSON 상세 출력
         st.markdown("<br>##### 📌 선택된 추출 정보 전체 데이터", unsafe_allow_html=True)
@@ -148,30 +200,30 @@ if uploaded_pdf and uploaded_xml:
             else:
                 st.info("👆 위 테이블에서 행을 클릭하면 전체 매핑 정보가 이곳에 출력됩니다.")
                 
-        # 미매핑 / 미처리 XML 데이터 출력 (Front 실패건, Body, Back 전체)
+        # 미매핑 / 미처리 XML 데이터 출력
         st.markdown("<br>##### ⚠️ 매핑 실패 및 미처리 XML 데이터", unsafe_allow_html=True)
+        tab_f_fail, tab_b_fail, tab_bk_fail = st.tabs(["Front (매핑 실패)", "Body (원문)", "Back (매핑 실패)"])
         
-        tab_f, tab_b, tab_bk = st.tabs(["Front (매핑 실패)", "Body (미처리)", "Back (미처리)"])
-        with tab_f:
+        with tab_f_fail:
             if unmapped_xml_front:
                 for raw_xml in unmapped_xml_front:
                     st.code(raw_xml, language="xml")
             else:
-                st.success("Front 영역의 저자 정보가 모두 매핑되었습니다.")
+                st.success("Front 영역 검사 대상이 모두 매핑되었습니다.")
                 
-        with tab_b:
+        with tab_b_fail:
             body_node = root.find('.//body')
             if body_node is not None:
-                st.code(get_raw_xml(body_node), language="xml")
+                st.code(get_raw_xml(body_node)[:2000] + "\n... (생략)", language="xml")
             else:
                 st.info("Body 영역이 없습니다.")
                 
-        with tab_bk:
-            back_node = root.find('.//back')
-            if back_node is not None:
-                st.code(get_raw_xml(back_node), language="xml")
+        with tab_bk_fail:
+            if unmapped_xml_back:
+                for raw_xml in unmapped_xml_back:
+                    st.code(raw_xml, language="xml")
             else:
-                st.info("Back 영역이 없습니다.")
+                st.success("Back 영역의 참고문헌이 모두 95% 이상 일치율로 매핑되었습니다.")
 
     with col_img:
         st.subheader(f"📄 PDF 시각화 (Page {page_num})")
@@ -183,7 +235,7 @@ if uploaded_pdf and uploaded_xml:
         draw = ImageDraw.Draw(img)
         
         # 선택된 데이터가 있고, 좌표가 존재할 경우 파란색 박스로 시각화
-        if selected_row_data and selected_row_data['bbox'] != "None" and selected_row_data['page'] == page_num:
+        if selected_row_data and selected_row_data.get('bbox') != "None" and selected_row_data.get('page') == page_num:
             try:
                 bbox = ast.literal_eval(selected_row_data['bbox'])
                 scaled_bbox = [b * zoom for b in bbox]
