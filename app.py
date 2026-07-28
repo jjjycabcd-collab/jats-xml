@@ -190,7 +190,7 @@ if uploaded_pdf and uploaded_xml:
                         mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                         unmapped_xml_body.append(get_raw_xml(title_node))
         
-        # 2. 문단 (p) 매칭: 공백/엔터라인 제거 후 3글자 일치 확인 및 다중 블록 병합
+        # 2. 문단 (p) 매칭
         for p_node in body_node.findall('.//p'):
             xml_text = extract_xml_text(p_node)
             if not xml_text: continue
@@ -204,14 +204,12 @@ if uploaded_pdf and uploaded_xml:
             for i in range(len(extracted_pdf_texts)):
                 clean_pdf_block = extracted_pdf_texts[i]["text"].replace(" ", "").replace("\n", "").strip()
                 
-                # 시작 3글자가 일치하는 블록을 찾으면 누적 시작
                 if clean_pdf_block.startswith(xml_prefix):
                     accumulated_text = ""
                     min_x0, min_y0, max_x1, max_y1 = float('inf'), float('inf'), float('-inf'), float('-inf')
                     match_page = extracted_pdf_texts[i]["page"]
                     
                     for j in range(i, len(extracted_pdf_texts)):
-                        # 페이지가 넘어가면 하나의 사각형으로 묶기 어려우므로 일단 현재 페이지 안에서만 병합
                         if extracted_pdf_texts[j]["page"] != match_page:
                             break
                             
@@ -229,7 +227,6 @@ if uploaded_pdf and uploaded_xml:
                             best_bbox = [min_x0, min_y0, max_x1, max_y1]
                             best_page = match_page
                         
-                        # 텍스트가 너무 길어지면 무의미하므로 중단
                         if len(accumulated_text.replace(" ", "").replace("\n", "")) > len(clean_xml) * 1.5:
                             break
             
@@ -308,7 +305,35 @@ if uploaded_pdf and uploaded_xml:
                 mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": best_page if best_page != -1 else 0, "bbox": "None", "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                 unmapped_xml_back.append(get_raw_xml(ref))
 
+    # ==========================================
+    # [데이터프레임 생성 및 PDF 좌표 기준 정렬 로직 적용]
+    # ==========================================
     df = pd.DataFrame(mapped_data)
+    
+    if not df.empty:
+        def get_sort_keys(row):
+            page = row['page']
+            bbox_str = row['bbox']
+            if bbox_str == "None":
+                return page, 9999, 9999  # 매핑 실패 항목은 맨 뒤로 배치
+            try:
+                bbox = ast.literal_eval(bbox_str)
+                x0, y0, x1, y1 = bbox
+                # 250px 단위로 묶어 단(Column)을 나눔 (1단/2단 모두 포괄 처리)
+                col = int(x0 // 250)
+                return page, col, y0
+            except:
+                return page, 9999, 9999
+
+        # 정렬용 보조 키 생성
+        df['sort_page'] = df.apply(lambda x: get_sort_keys(x)[0], axis=1)
+        df['sort_col']  = df.apply(lambda x: get_sort_keys(x)[1], axis=1)
+        df['sort_y0']   = df.apply(lambda x: get_sort_keys(x)[2], axis=1)
+        
+        # 페이지 -> 단(가로) -> 세로 순서대로 정렬 후 보조 키 삭제
+        df = df.sort_values(by=['sort_page', 'sort_col', 'sort_y0'])
+        df = df.drop(columns=['sort_page', 'sort_col', 'sort_y0']).reset_index(drop=True)
+
     selected_row_data = None
 
     # 3. 화면 분할 출력
@@ -323,7 +348,7 @@ if uploaded_pdf and uploaded_xml:
             with tab_front:
                 if not df.empty and "Front" in df["category"].values:
                     df_front = df[df["category"] == "Front"].reset_index(drop=True)
-                    event_front = st.dataframe(df_front, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_f")
+                    event_front = st.dataframe(df_front, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row", key="df_f")
                     if len(event_front.selection.rows) > 0:
                         selected_row_data = df_front.iloc[event_front.selection.rows[0]].to_dict()
                         if selected_row_data['bbox'] != "None":
@@ -335,7 +360,7 @@ if uploaded_pdf and uploaded_xml:
             with tab_body:
                 if not df.empty and "Body" in df["category"].values:
                     df_body = df[df["category"] == "Body"].reset_index(drop=True)
-                    event_body = st.dataframe(df_body, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_body_tab")
+                    event_body = st.dataframe(df_body, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row", key="df_body_tab")
                     if len(event_body.selection.rows) > 0 and selected_row_data is None:
                         selected_row_data = df_body.iloc[event_body.selection.rows[0]].to_dict()
                         if selected_row_data['bbox'] != "None":
@@ -349,7 +374,7 @@ if uploaded_pdf and uploaded_xml:
             with tab_back:
                 if not df.empty and "Back" in df["category"].values:
                     df_back = df[df["category"] == "Back"].reset_index(drop=True)
-                    event_back = st.dataframe(df_back, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_b")
+                    event_back = st.dataframe(df_back, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row", key="df_b")
                     if len(event_back.selection.rows) > 0 and selected_row_data is None:
                         selected_row_data = df_back.iloc[event_back.selection.rows[0]].to_dict()
                         if selected_row_data['bbox'] != "None":
