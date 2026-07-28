@@ -12,7 +12,7 @@ import difflib
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="JATS XML-PDF 라벨링 검수 툴")
 st.title("JATS XML - PDF 저자 및 참고문헌 매칭 검수 도구")
-st.markdown("XML 데이터를 기준으로 PDF 텍스트와 유사도를 비교하여 바운딩 박스를 추출합니다.")
+st.markdown("XML 데이터를 기준으로 PDF 전체 텍스트를 탐색하여 바운딩 박스를 추출합니다.")
 
 # 사이드바 매칭 임계값 설정
 st.sidebar.header("매칭 임계값 설정 (Threshold)")
@@ -40,14 +40,15 @@ def get_raw_xml(element):
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
 def find_best_match(xml_text, pdf_texts):
-    """일반 텍스트의 최고 유사도와 바운딩 박스 반환"""
-    best_match_ratio, best_bbox = 0, None
+    """전체 문서 텍스트 중 최고 유사도, 바운딩 박스, 페이지 번호 반환"""
+    best_match_ratio, best_bbox, best_page = 0, None, -1
     for pdf_item in pdf_texts:
         ratio = get_similarity(xml_text, pdf_item["text"])
         if ratio > best_match_ratio:
             best_match_ratio = ratio
             best_bbox = pdf_item["bbox"]
-    return best_match_ratio, best_bbox
+            best_page = pdf_item["page"]
+    return best_match_ratio, best_bbox, best_page
 
 # ---------------------------------------------------------
 # 메인 로직
@@ -72,14 +73,19 @@ if uploaded_pdf and uploaded_xml:
     page_num = st.sidebar.number_input(f"페이지 번호 (0 ~ {len(doc)-1})", min_value=0, max_value=len(doc)-1, value=0)
     page = doc[page_num]
     
-    # 1. PDF 텍스트 블록 및 좌표 추출
-    pdf_blocks = page.get_text("dict")["blocks"]
+    # 1. PDF 전체 문서 텍스트 블록 및 좌표 추출 (페이지 정보 포함)
     extracted_pdf_texts = []
-    for b in pdf_blocks:
-        if "lines" in b:
-            block_text = "".join([span["text"] for line in b["lines"] for span in line["spans"]])
-            block_text = block_text.replace("- ", "").replace("-\n", "")
-            extracted_pdf_texts.append({"text": block_text, "bbox": b["bbox"]})
+    for p_num in range(len(doc)):
+        p_blocks = doc[p_num].get_text("dict")["blocks"]
+        for b in p_blocks:
+            if "lines" in b:
+                block_text = "".join([span["text"] for line in b["lines"] for span in line["spans"]])
+                block_text = block_text.replace("- ", "").replace("-\n", "")
+                extracted_pdf_texts.append({
+                    "page": p_num, 
+                    "text": block_text, 
+                    "bbox": b["bbox"]
+                })
 
     mapped_data = []
     unmapped_xml_front = []
@@ -97,13 +103,11 @@ if uploaded_pdf and uploaded_xml:
                 surname = extract_xml_text(name_node.find('surname'))
                 given = extract_xml_text(name_node.find('given-names'))
                 
-                # 포맷 1: 이름 + 성 / 포맷 2: 성 + 이름
                 format1 = given + surname
                 format2 = surname + given
                 
-                best_match_ratio, best_bbox = 0, None
+                best_match_ratio, best_bbox, best_page = 0, None, -1
                 for pdf_item in extracted_pdf_texts:
-                    # 두 가지 포맷 중 더 높은 유사도를 채택
                     ratio1 = get_similarity(format1, pdf_item["text"])
                     ratio2 = get_similarity(format2, pdf_item["text"])
                     max_ratio = max(ratio1, ratio2)
@@ -111,58 +115,67 @@ if uploaded_pdf and uploaded_xml:
                     if max_ratio > best_match_ratio:
                         best_match_ratio = max_ratio
                         best_bbox = pdf_item["bbox"]
+                        best_page = pdf_item["page"]
                 
                 xml_display_text = f"{given} {surname}".strip()
                 if best_match_ratio >= FRONT_THRESHOLD:
                     mapped_data.append({
                         "category": "Front", "tag": "name", "xml_text": xml_display_text,
-                        "page": page_num, "bbox": str([round(c, 2) for c in best_bbox]),
+                        "page": best_page, "bbox": str([round(c, 2) for c in best_bbox]),
                         "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"
                     })
                 else:
                     mapped_data.append({
                         "category": "Front", "tag": "name", "xml_text": xml_display_text,
-                        "page": page_num, "bbox": "None",
+                        "page": best_page if best_page != -1 else 0, "bbox": "None",
                         "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"
                     })
                     unmapped_xml_front.append(get_raw_xml(name_node))
 
-            # 2. 이메일 (email) 매칭
+            # 2. 이메일, 3. ORCID, 4. 역할 매칭
             for email_node in contrib.findall('.//email'):
                 xml_text = extract_xml_text(email_node)
                 if not xml_text: continue
-                ratio, bbox = find_best_match(xml_text, extracted_pdf_texts)
+                ratio, bbox, b_page = find_best_match(xml_text, extracted_pdf_texts)
                 if ratio >= FRONT_THRESHOLD:
-                    mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": page_num, "bbox": str([round(c, 2) for c in bbox]), "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                    mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": b_page, "bbox": str([round(c, 2) for c in bbox]), "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else:
-                    mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": page_num, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
+                    mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                     unmapped_xml_front.append(get_raw_xml(email_node))
 
-            # 3. ORCID (contrib-id) 매칭
             for orcid_node in contrib.findall('.//contrib-id'):
                 if orcid_node.attrib.get('contrib-id-type') == 'orcid' or 'orcid' in extract_xml_text(orcid_node).lower():
                     xml_text = extract_xml_text(orcid_node)
-                    ratio, bbox = find_best_match(xml_text, extracted_pdf_texts)
+                    ratio, bbox, b_page = find_best_match(xml_text, extracted_pdf_texts)
                     if ratio >= FRONT_THRESHOLD:
-                        mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": page_num, "bbox": str([round(c, 2) for c in bbox]), "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                        mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": b_page, "bbox": str([round(c, 2) for c in bbox]), "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                     else:
-                        mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": page_num, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
+                        mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                         unmapped_xml_front.append(get_raw_xml(orcid_node))
 
-            # 4. 저자 역할 (role) 매칭
             for role_node in contrib.findall('.//role'):
                 xml_text = extract_xml_text(role_node)
                 if not xml_text: continue
-                ratio, bbox = find_best_match(xml_text, extracted_pdf_texts)
+                ratio, bbox, b_page = find_best_match(xml_text, extracted_pdf_texts)
                 if ratio >= FRONT_THRESHOLD:
-                    mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": page_num, "bbox": str([round(c, 2) for c in bbox]), "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                    mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": str([round(c, 2) for c in bbox]), "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else:
-                    mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": page_num, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
+                    mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                     unmapped_xml_front.append(get_raw_xml(role_node))
 
     # ==========================================
-    # [Back - 참고문헌 매칭] - 다중 블록 병합
+    # [Back - 참고문헌 영역 찾기 및 다중 블록 병합 매칭]
     # ==========================================
+    # PDF 전체 텍스트에서 "참고문헌"이 시작되는 인덱스를 찾음
+    ref_start_idx = 0
+    for i, item in enumerate(extracted_pdf_texts):
+        clean_text = item["text"].replace(" ", "").strip()
+        if clean_text in ["참고문헌", "REFERENCES", "References"]:
+            ref_start_idx = i
+            break
+            
+    pdf_texts_for_back = extracted_pdf_texts[ref_start_idx:]
+
     back_node = root.find('.//back')
     if back_node is not None:
         for ref in back_node.findall('.//ref'):
@@ -175,21 +188,25 @@ if uploaded_pdf and uploaded_xml:
             clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
             if len(clean_xml) < 3: continue
             
-            # 조건 2: 3글자 시작점 확인을 위한 Prefix
             xml_prefix = clean_xml[:3]
-            best_match_ratio, best_bbox = 0, None
+            best_match_ratio, best_bbox, best_page = 0, None, -1
             
-            for i in range(len(extracted_pdf_texts)):
-                clean_pdf_block = extracted_pdf_texts[i]["text"].replace(" ", "").replace("\n", "").strip()
+            # 참고문헌 영역(pdf_texts_for_back) 내에서 탐색
+            for i in range(len(pdf_texts_for_back)):
+                clean_pdf_block = pdf_texts_for_back[i]["text"].replace(" ", "").replace("\n", "").strip()
                 
-                # 시작 3글자가 일치하는 블록 탐색
                 if clean_pdf_block.startswith(xml_prefix):
                     accumulated_text = ""
                     min_x0, min_y0, max_x1, max_y1 = float('inf'), float('inf'), float('-inf'), float('-inf')
+                    match_page = pdf_texts_for_back[i]["page"]
                     
-                    for j in range(i, len(extracted_pdf_texts)):
-                        accumulated_text += extracted_pdf_texts[j]["text"]
-                        bx0, by0, bx1, by1 = extracted_pdf_texts[j]["bbox"]
+                    for j in range(i, len(pdf_texts_for_back)):
+                        # 블록 병합 시 페이지가 넘어가면 엉뚱한 박스가 생성되므로 같은 페이지 내에서만 병합
+                        if pdf_texts_for_back[j]["page"] != match_page:
+                            break
+                            
+                        accumulated_text += pdf_texts_for_back[j]["text"]
+                        bx0, by0, bx1, by1 = pdf_texts_for_back[j]["bbox"]
                         min_x0 = min(min_x0, bx0)
                         min_y0 = min(min_y0, by0)
                         max_x1 = max(max_x1, bx1)
@@ -199,6 +216,7 @@ if uploaded_pdf and uploaded_xml:
                         if ratio > best_match_ratio:
                             best_match_ratio = ratio
                             best_bbox = [min_x0, min_y0, max_x1, max_y1]
+                            best_page = match_page
                         
                         if len(accumulated_text.replace(" ", "")) > len(clean_xml) * 1.5:
                             break
@@ -206,13 +224,13 @@ if uploaded_pdf and uploaded_xml:
             if best_match_ratio >= BACK_THRESHOLD:
                 mapped_data.append({
                     "category": "Back", "tag": "annotation", "xml_text": xml_text,
-                    "page": page_num, "bbox": str([round(c, 2) for c in best_bbox]),
+                    "page": best_page, "bbox": str([round(c, 2) for c in best_bbox]),
                     "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"
                 })
             else:
                 mapped_data.append({
                     "category": "Back", "tag": "annotation", "xml_text": xml_text,
-                    "page": page_num, "bbox": "None",
+                    "page": best_page if best_page != -1 else 0, "bbox": "None",
                     "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"
                 })
                 unmapped_xml_back.append(get_raw_xml(ref))
@@ -276,13 +294,17 @@ if uploaded_pdf and uploaded_xml:
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             draw = ImageDraw.Draw(img)
             
-            if selected_row_data and selected_row_data.get('bbox') != "None" and selected_row_data.get('page') == page_num:
-                try:
-                    bbox = ast.literal_eval(selected_row_data['bbox'])
-                    scaled_bbox = [b * zoom for b in bbox]
-                    draw.rectangle(scaled_bbox, outline="blue", width=4)
-                except Exception:
-                    st.warning("⚠️ 좌표 데이터 형식이 올바르지 않습니다.")
+            # 선택된 행의 'page' 값이 현재 좌측에 렌더링된 'page_num'과 일치할 때만 바운딩 박스를 그림
+            if selected_row_data and selected_row_data.get('bbox') != "None":
+                if selected_row_data.get('page') == page_num:
+                    try:
+                        bbox = ast.literal_eval(selected_row_data['bbox'])
+                        scaled_bbox = [b * zoom for b in bbox]
+                        draw.rectangle(scaled_bbox, outline="blue", width=4)
+                    except Exception:
+                        st.warning("⚠️ 좌표 데이터 형식이 올바르지 않습니다.")
+                else:
+                    st.info(f"선택한 데이터는 **페이지 {selected_row_data.get('page')}**에 존재합니다. 좌측 네비게이션을 변경해 주세요.")
             elif selected_row_data and selected_row_data.get('bbox') == "None":
                 st.warning("⚠️ 선택된 항목은 매핑에 실패하여 좌표(bbox) 정보가 존재하지 않습니다.")
                     
