@@ -29,7 +29,6 @@ st.sidebar.header("매칭 임계값 설정 (Threshold)")
 FRONT_THRESHOLD = st.sidebar.slider("Front (저자 항목별) 매칭 기준", 0.0, 1.0, 0.70, 0.05)
 BODY_TITLE_THRESHOLD = st.sidebar.slider("Body (본문 제목) 매칭 기준", 0.0, 1.0, 0.95, 0.05) 
 BODY_P_THRESHOLD = st.sidebar.slider("Body (본문 문단) 매칭 기준", 0.0, 1.0, 0.70, 0.05) 
-# [신규] 표/그림 제목 매칭 임계값 80% 설정
 BODY_FIG_TABLE_THRESHOLD = st.sidebar.slider("Body (표/그림 제목) 매칭 기준", 0.0, 1.0, 0.80, 0.05) 
 BACK_THRESHOLD = st.sidebar.slider("Back (참고문헌) 매칭 기준", 0.0, 1.0, 0.65, 0.05) 
 
@@ -71,9 +70,45 @@ if uploaded_pdf and uploaded_xml:
     try:
         tree = ET.parse(uploaded_xml)
         root = tree.getroot()
+        # 노드의 부모를 추적하기 위한 parent_map 생성
+        parent_map = {c: p for p in root.iter() for c in p}
     except Exception as e:
         st.error(f"❌ XML 파싱 오류: {e}")
         st.stop()
+
+    def should_exclude_body_node(node):
+        """요약, 초록, 키워드 등 Body 매핑에서 제외할 노드인지 판별"""
+        text = extract_xml_text(node).replace(" ", "").replace("\n", "").lower()
+        if not text: return False
+        
+        # 1. 단락이 키워드/주제어로 시작하는 경우
+        prefix_exclusions = ["keyword", "keywords", "핵심어", "주제어", "핵심주제어"]
+        if any(text.startswith(p) for p in prefix_exclusions):
+            return True
+            
+        exact_abstract_titles = ["요약", "국문요약", "영문요약", "초록", "국문초록", "영문초록", "abstract"]
+        
+        # 2. 현재 노드가 title일 경우 검사
+        if node.tag == 'title':
+            clean_title = text.strip("1234567890.ivx()[]<>- ")
+            if clean_title in exact_abstract_titles:
+                return True
+                
+        # 3. 부모 노드를 역추적하여 속한 섹션이 요약/초록인지 검사
+        curr = node
+        while curr is not None:
+            if curr.tag in ['abstract', 'kwd-group', 'kwd']:
+                return True
+            if curr.tag == 'sec':
+                title_node = curr.find('title')
+                if title_node is not None:
+                    t_text = extract_xml_text(title_node).replace(" ", "").replace("\n", "").lower()
+                    clean_t_text = t_text.strip("1234567890.ivx()[]<>- ")
+                    if clean_t_text in exact_abstract_titles:
+                        return True
+            curr = parent_map.get(curr)
+            
+        return False
 
     doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
     
@@ -145,7 +180,7 @@ if uploaded_pdf and uploaded_xml:
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
     # ==========================================
-    # [Body - 본문 제목, 문단, 표/그림 제목 매칭]
+    # [Body - 본문 매칭 (초록/키워드 제외 로직 적용)]
     # ==========================================
     body_node = root.find('.//body')
     if body_node is not None:
@@ -154,6 +189,10 @@ if uploaded_pdf and uploaded_xml:
         for sec_node in body_node.findall('.//sec'):
             title_node = sec_node.find('title')
             if title_node is not None:
+                # [추가] 초록/키워드 노드 필터링
+                if should_exclude_body_node(title_node):
+                    continue
+                
                 xml_text = extract_xml_text(title_node)
                 if xml_text:
                     ratio, bbox, b_page = find_best_match(xml_text, extracted_pdf_texts)
@@ -162,6 +201,9 @@ if uploaded_pdf and uploaded_xml:
         
         # 2. 표 (table-wrap) / 그림 (fig) 매칭
         for fig_table_node in body_node.findall('.//table-wrap') + body_node.findall('.//fig'):
+            if should_exclude_body_node(fig_table_node):
+                continue
+                
             tag_name = fig_table_node.tag
             label_node = fig_table_node.find('label')
             title_node = fig_table_node.find('.//caption/title')
@@ -175,7 +217,7 @@ if uploaded_pdf and uploaded_xml:
             if not xml_text: continue
             
             clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
-            if len(clean_xml) < 2: continue # '표1' 처럼 짧을 수 있으므로 2글자 허용
+            if len(clean_xml) < 2: continue 
             
             xml_prefix = clean_xml[:2]
             best_match_ratio, best_bbox, best_page = 0, None, -1
@@ -209,6 +251,10 @@ if uploaded_pdf and uploaded_xml:
 
         # 3. 문단 (p) 매칭
         for p_node in body_node.findall('.//p'):
+            # [추가] 초록/키워드 노드 필터링
+            if should_exclude_body_node(p_node):
+                continue
+                
             xml_text = extract_xml_text(p_node)
             if not xml_text: continue
             
@@ -380,7 +426,6 @@ if uploaded_pdf and uploaded_xml:
     # [좌측 패널] PDF 연속 뷰어 (Fragment 사용으로 독립적 렌더링)
     @fragment
     def render_pdf_viewer(doc, selected_row):
-        # 상단 네비게이션
         nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
         with nav_col1:
             if st.button("◀ 이전 페이지", use_container_width=True):
@@ -397,11 +442,9 @@ if uploaded_pdf and uploaded_xml:
             
         st.divider()
         
-        # 전체 페이지 연속 스크롤 렌더링
         with st.container(height=750):
             zoom = 2.0  
             for i in range(len(doc)):
-                # 각 이미지 상단에 고유 앵커(ID) 부여
                 st.markdown(f"<div id='pdf_page_{i}'></div>", unsafe_allow_html=True)
                 
                 page = doc[i]
@@ -409,7 +452,6 @@ if uploaded_pdf and uploaded_xml:
                 pix = page.get_pixmap(matrix=mat)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 
-                # 선택된 행의 데이터가 현재 루프의 페이지와 일치하면 박스 그리기
                 if selected_row and selected_row.get('bbox') != "None" and int(selected_row.get('page')) == i:
                     try:
                         bbox = ast.literal_eval(selected_row['bbox'])
@@ -421,7 +463,6 @@ if uploaded_pdf and uploaded_xml:
                         
                 st.image(img, use_container_width=True)
                 
-            # 상태값에 맞춰 자바스크립트를 통한 스무스 스크롤 트리거
             components.html(
                 f"""
                 <script>
@@ -435,6 +476,5 @@ if uploaded_pdf and uploaded_xml:
                 width=0
             )
 
-    # 좌측 영역에 Fragment 함수 호출
     with col_img:
         render_pdf_viewer(doc, selected_row_data)
