@@ -69,8 +69,18 @@ if uploaded_pdf and uploaded_xml:
 
     doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
     
+    # 세션 상태를 활용한 페이지 네비게이션 제어
+    if "pdf_page" not in st.session_state:
+        st.session_state.pdf_page = 0
+        
     st.sidebar.header("네비게이션")
-    page_num = st.sidebar.number_input(f"페이지 번호 (0 ~ {len(doc)-1})", min_value=0, max_value=len(doc)-1, value=0)
+    st.sidebar.number_input(
+        f"페이지 번호 (0 ~ {len(doc)-1})", 
+        min_value=0, 
+        max_value=len(doc)-1, 
+        key="pdf_page" # 세션 상태 변수와 위젯 연동
+    )
+    page_num = st.session_state.pdf_page
     page = doc[page_num]
     
     # 1. PDF 전체 문서 텍스트 블록 및 좌표 추출 (페이지 정보 포함)
@@ -166,7 +176,6 @@ if uploaded_pdf and uploaded_xml:
     # ==========================================
     # [Back - 참고문헌 영역 찾기 및 다중 블록 병합 매칭]
     # ==========================================
-    # PDF 전체 텍스트에서 "참고문헌"이 시작되는 인덱스를 찾음
     ref_start_idx = 0
     for i, item in enumerate(extracted_pdf_texts):
         clean_text = item["text"].replace(" ", "").strip()
@@ -191,7 +200,6 @@ if uploaded_pdf and uploaded_xml:
             xml_prefix = clean_xml[:3]
             best_match_ratio, best_bbox, best_page = 0, None, -1
             
-            # 참고문헌 영역(pdf_texts_for_back) 내에서 탐색
             for i in range(len(pdf_texts_for_back)):
                 clean_pdf_block = pdf_texts_for_back[i]["text"].replace(" ", "").replace("\n", "").strip()
                 
@@ -201,7 +209,6 @@ if uploaded_pdf and uploaded_xml:
                     match_page = pdf_texts_for_back[i]["page"]
                     
                     for j in range(i, len(pdf_texts_for_back)):
-                        # 블록 병합 시 페이지가 넘어가면 엉뚱한 박스가 생성되므로 같은 페이지 내에서만 병합
                         if pdf_texts_for_back[j]["page"] != match_page:
                             break
                             
@@ -248,12 +255,17 @@ if uploaded_pdf and uploaded_xml:
             st.subheader("📊 영역별 매칭 데이터 (Front & Back)")
             tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (미구현)", "Back (참고문헌)"])
             
+            # [기능 추가] 선택 시 페이지 자동 이동 로직 적용
             with tab_front:
                 if not df.empty and "Front" in df["category"].values:
                     df_front = df[df["category"] == "Front"].reset_index(drop=True)
                     event_front = st.dataframe(df_front, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_f")
                     if len(event_front.selection.rows) > 0:
                         selected_row_data = df_front.iloc[event_front.selection.rows[0]].to_dict()
+                        # 매핑 성공이고, 현재 페이지와 선택된 데이터의 페이지가 다르면 페이지 이동
+                        if selected_row_data['bbox'] != "None" and selected_row_data['page'] != st.session_state.pdf_page:
+                            st.session_state.pdf_page = int(selected_row_data['page'])
+                            st.rerun()
                         
             with tab_body:
                 st.info("Body 영역 매칭 로직은 아직 적용되지 않았습니다.")
@@ -264,6 +276,10 @@ if uploaded_pdf and uploaded_xml:
                     event_back = st.dataframe(df_back, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_b")
                     if len(event_back.selection.rows) > 0 and selected_row_data is None:
                         selected_row_data = df_back.iloc[event_back.selection.rows[0]].to_dict()
+                        # 매핑 성공이고, 현재 페이지와 선택된 데이터의 페이지가 다르면 페이지 이동
+                        if selected_row_data['bbox'] != "None" and selected_row_data['page'] != st.session_state.pdf_page:
+                            st.session_state.pdf_page = int(selected_row_data['page'])
+                            st.rerun()
                 
             st.markdown("<br>##### 📌 선택된 추출 정보 전체 데이터", unsafe_allow_html=True)
             with st.container(height=200):
@@ -295,16 +311,13 @@ if uploaded_pdf and uploaded_xml:
             draw = ImageDraw.Draw(img)
             
             # 선택된 행의 'page' 값이 현재 좌측에 렌더링된 'page_num'과 일치할 때만 바운딩 박스를 그림
-            if selected_row_data and selected_row_data.get('bbox') != "None":
-                if selected_row_data.get('page') == page_num:
-                    try:
-                        bbox = ast.literal_eval(selected_row_data['bbox'])
-                        scaled_bbox = [b * zoom for b in bbox]
-                        draw.rectangle(scaled_bbox, outline="blue", width=4)
-                    except Exception:
-                        st.warning("⚠️ 좌표 데이터 형식이 올바르지 않습니다.")
-                else:
-                    st.info(f"선택한 데이터는 **페이지 {selected_row_data.get('page')}**에 존재합니다. 좌측 네비게이션을 변경해 주세요.")
+            if selected_row_data and selected_row_data.get('bbox') != "None" and selected_row_data.get('page') == page_num:
+                try:
+                    bbox = ast.literal_eval(selected_row_data['bbox'])
+                    scaled_bbox = [b * zoom for b in bbox]
+                    draw.rectangle(scaled_bbox, outline="blue", width=4)
+                except Exception:
+                    st.warning("⚠️ 좌표 데이터 형식이 올바르지 않습니다.")
             elif selected_row_data and selected_row_data.get('bbox') == "None":
                 st.warning("⚠️ 선택된 항목은 매핑에 실패하여 좌표(bbox) 정보가 존재하지 않습니다.")
                     
