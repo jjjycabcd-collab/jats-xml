@@ -11,15 +11,18 @@ import difflib
 # 설정 및 헬퍼 함수
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="JATS XML-PDF 라벨링 검수 툴")
-st.title("JATS XML - PDF 저자 및 참고문헌 매칭 검수 도구")
+st.title("JATS XML - PDF 태깅 시각화 및 검수 도구")
 st.markdown("XML 데이터를 기준으로 PDF 전체 텍스트를 탐색하여 바운딩 박스를 추출합니다.")
 
 # 사이드바 매칭 임계값 설정
 st.sidebar.header("매칭 임계값 설정 (Threshold)")
 FRONT_THRESHOLD = st.sidebar.slider("Front (저자 항목별) 매칭 기준", 0.0, 1.0, 0.70, 0.05)
+# 본문(Body) 제목 매칭 임계값 추가 (95% 기준)
+BODY_THRESHOLD = st.sidebar.slider("Body (본문 제목) 매칭 기준", 0.0, 1.0, 0.95, 0.05) 
 BACK_THRESHOLD = st.sidebar.slider("Back (참고문헌) 매칭 기준", 0.0, 1.0, 0.65, 0.05) 
 
 def get_similarity(text1, text2):
+    """두 문자열 간의 유사도를 0.0 ~ 1.0 사이로 반환 (공백/줄바꿈 완벽히 제거 후 비교)"""
     if not text1 or not text2:
         return 0.0
     t1 = text1.replace(" ", "").replace("\n", "").strip()
@@ -27,16 +30,19 @@ def get_similarity(text1, text2):
     return difflib.SequenceMatcher(None, t1, t2).ratio()
 
 def extract_xml_text(element):
+    """XML 엘리먼트 내의 모든 텍스트를 재귀적으로 추출"""
     if element is None:
         return ""
     return "".join(element.itertext()).strip()
 
 def get_raw_xml(element):
+    """XML 엘리먼트를 원시 문자열로 변환"""
     if element is None:
         return ""
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
 def find_best_match(xml_text, pdf_texts):
+    """전체 문서 텍스트 중 최고 유사도, 바운딩 박스, 페이지 번호 반환"""
     best_match_ratio, best_bbox, best_page = 0, None, -1
     for pdf_item in pdf_texts:
         ratio = get_similarity(xml_text, pdf_item["text"])
@@ -65,13 +71,11 @@ if uploaded_pdf and uploaded_xml:
 
     doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
     
-    # --- [상태 관리(Session State) 수정 부분] ---
-    # 위젯 key와 내부 상태 변수(target_page)를 분리하여 동기화
+    # 상태 관리(Session State) 동기화
     if "target_page" not in st.session_state:
         st.session_state.target_page = 0
         
     def sync_page():
-        """사이드바 넘버 인풋이 변경될 때 상태 업데이트"""
         st.session_state.target_page = st.session_state.pdf_page_input
 
     st.sidebar.header("네비게이션")
@@ -79,9 +83,9 @@ if uploaded_pdf and uploaded_xml:
         f"페이지 번호 (0 ~ {len(doc)-1})", 
         min_value=0, 
         max_value=len(doc)-1, 
-        value=st.session_state.target_page, # 초기값은 내부 상태로 지정
-        key="pdf_page_input",               # 위젯 전용 고유 키
-        on_change=sync_page                 # 값 변경 시 콜백 실행
+        value=st.session_state.target_page, 
+        key="pdf_page_input",               
+        on_change=sync_page                 
     )
     
     page_num = st.session_state.target_page
@@ -103,6 +107,7 @@ if uploaded_pdf and uploaded_xml:
 
     mapped_data = []
     unmapped_xml_front = []
+    unmapped_xml_body = []
     unmapped_xml_back = []
     
     # ==========================================
@@ -132,17 +137,9 @@ if uploaded_pdf and uploaded_xml:
                 
                 xml_display_text = f"{given} {surname}".strip()
                 if best_match_ratio >= FRONT_THRESHOLD:
-                    mapped_data.append({
-                        "category": "Front", "tag": "name", "xml_text": xml_display_text,
-                        "page": best_page, "bbox": str([round(c, 2) for c in best_bbox]),
-                        "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"
-                    })
+                    mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "page": best_page, "bbox": str([round(c, 2) for c in best_bbox]), "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else:
-                    mapped_data.append({
-                        "category": "Front", "tag": "name", "xml_text": xml_display_text,
-                        "page": best_page if best_page != -1 else 0, "bbox": "None",
-                        "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"
-                    })
+                    mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "page": best_page if best_page != -1 else 0, "bbox": "None", "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                     unmapped_xml_front.append(get_raw_xml(name_node))
 
             for email_node in contrib.findall('.//email'):
@@ -174,6 +171,35 @@ if uploaded_pdf and uploaded_xml:
                 else:
                     mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                     unmapped_xml_front.append(get_raw_xml(role_node))
+
+    # ==========================================
+    # [Body - 본문 제목 (sec/title) 매칭]
+    # ==========================================
+    body_node = root.find('.//body')
+    if body_node is not None:
+        for sec_node in body_node.findall('.//sec'):
+            title_node = sec_node.find('title')
+            if title_node is None: continue
+            
+            xml_text = extract_xml_text(title_node)
+            if not xml_text: continue
+            
+            # get_similarity 함수 내부에서 이미 공백을 모두 제거하고 비교합니다.
+            ratio, bbox, b_page = find_best_match(xml_text, extracted_pdf_texts)
+            
+            if ratio >= BODY_THRESHOLD:
+                mapped_data.append({
+                    "category": "Body", "tag": "sec/title", "xml_text": xml_text, 
+                    "page": b_page, "bbox": str([round(c, 2) for c in bbox]), 
+                    "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"
+                })
+            else:
+                mapped_data.append({
+                    "category": "Body", "tag": "sec/title", "xml_text": xml_text, 
+                    "page": b_page if b_page != -1 else 0, "bbox": "None", 
+                    "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"
+                })
+                unmapped_xml_body.append(get_raw_xml(title_node))
 
     # ==========================================
     # [Back - 참고문헌 다중 블록 매칭]
@@ -254,34 +280,45 @@ if uploaded_pdf and uploaded_xml:
     # 우측 패널
     with col_data:
         with st.container(height=850):
-            st.subheader("📊 영역별 매칭 데이터 (Front & Back)")
-            tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (미구현)", "Back (참고문헌)"])
+            st.subheader("📊 영역별 매칭 데이터 검수")
+            tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (본문 제목)", "Back (참고문헌)"])
             
+            # [Front 탭]
             with tab_front:
                 if not df.empty and "Front" in df["category"].values:
                     df_front = df[df["category"] == "Front"].reset_index(drop=True)
                     event_front = st.dataframe(df_front, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_f")
                     if len(event_front.selection.rows) > 0:
                         selected_row_data = df_front.iloc[event_front.selection.rows[0]].to_dict()
-                        
-                        # --- 페이지 자동 이동 로직 (Front) ---
                         if selected_row_data['bbox'] != "None":
                             target_p = int(selected_row_data['page'])
                             if target_p != st.session_state.target_page:
                                 st.session_state.target_page = target_p
                                 st.rerun()
-                        
+                                
+            # [Body 탭] 추가된 영역
             with tab_body:
-                st.info("Body 영역 매칭 로직은 아직 적용되지 않았습니다.")
+                if not df.empty and "Body" in df["category"].values:
+                    df_body = df[df["category"] == "Body"].reset_index(drop=True)
+                    event_body = st.dataframe(df_body, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_body_tab")
+                    if len(event_body.selection.rows) > 0 and selected_row_data is None:
+                        selected_row_data = df_body.iloc[event_body.selection.rows[0]].to_dict()
+                        # 자동 페이지 이동 로직
+                        if selected_row_data['bbox'] != "None":
+                            target_p = int(selected_row_data['page'])
+                            if target_p != st.session_state.target_page:
+                                st.session_state.target_page = target_p
+                                st.rerun()
+                else:
+                    st.info("매핑된 Body 데이터가 없습니다.")
                 
+            # [Back 탭]
             with tab_back:
                 if not df.empty and "Back" in df["category"].values:
                     df_back = df[df["category"] == "Back"].reset_index(drop=True)
                     event_back = st.dataframe(df_back, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_b")
                     if len(event_back.selection.rows) > 0 and selected_row_data is None:
                         selected_row_data = df_back.iloc[event_back.selection.rows[0]].to_dict()
-                        
-                        # --- 페이지 자동 이동 로직 (Back) ---
                         if selected_row_data['bbox'] != "None":
                             target_p = int(selected_row_data['page'])
                             if target_p != st.session_state.target_page:
@@ -294,14 +331,16 @@ if uploaded_pdf and uploaded_xml:
                 else: st.info("👆 위 테이블에서 행을 클릭하면 전체 매핑 정보가 이곳에 출력됩니다.")
                     
             st.markdown("<br>##### ⚠️ 매핑 실패 및 미처리 XML 데이터", unsafe_allow_html=True)
-            tab_f_fail, tab_b_fail, tab_bk_fail = st.tabs(["Front (항목 실패)", "Body (원문)", "Back (실패)"])
+            tab_f_fail, tab_b_fail, tab_bk_fail = st.tabs(["Front (항목 실패)", "Body (항목 실패)", "Back (항목 실패)"])
             
             with tab_f_fail:
                 if unmapped_xml_front:
                     for raw in unmapped_xml_front: st.code(raw, language="xml")
             with tab_b_fail:
-                body_node = root.find('.//body')
-                if body_node is not None: st.code(get_raw_xml(body_node)[:2000] + "\n...", language="xml")
+                if unmapped_xml_body:
+                    for raw in unmapped_xml_body: st.code(raw, language="xml")
+                else:
+                    st.success("추출된 Body 제목 정보가 모두 매핑되었습니다.")
             with tab_bk_fail:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
