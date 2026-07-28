@@ -17,8 +17,8 @@ st.markdown("XML 데이터를 기준으로 PDF 전체 텍스트를 탐색하여 
 # 사이드바 매칭 임계값 설정
 st.sidebar.header("매칭 임계값 설정 (Threshold)")
 FRONT_THRESHOLD = st.sidebar.slider("Front (저자 항목별) 매칭 기준", 0.0, 1.0, 0.70, 0.05)
-# 본문(Body) 제목 매칭 임계값 추가 (95% 기준)
-BODY_THRESHOLD = st.sidebar.slider("Body (본문 제목) 매칭 기준", 0.0, 1.0, 0.95, 0.05) 
+BODY_TITLE_THRESHOLD = st.sidebar.slider("Body (본문 제목) 매칭 기준", 0.0, 1.0, 0.95, 0.05) 
+BODY_P_THRESHOLD = st.sidebar.slider("Body (본문 문단) 매칭 기준", 0.0, 1.0, 0.70, 0.05) 
 BACK_THRESHOLD = st.sidebar.slider("Back (참고문헌) 매칭 기준", 0.0, 1.0, 0.65, 0.05) 
 
 def get_similarity(text1, text2):
@@ -42,7 +42,7 @@ def get_raw_xml(element):
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
 def find_best_match(xml_text, pdf_texts):
-    """전체 문서 텍스트 중 최고 유사도, 바운딩 박스, 페이지 번호 반환"""
+    """단일 블록을 대상으로 최고 유사도, 바운딩 박스, 페이지 번호 반환"""
     best_match_ratio, best_bbox, best_page = 0, None, -1
     for pdf_item in pdf_texts:
         ratio = get_similarity(xml_text, pdf_item["text"])
@@ -116,7 +116,6 @@ if uploaded_pdf and uploaded_xml:
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
-            
             for name_node in contrib.findall('.//name'):
                 surname = extract_xml_text(name_node.find('surname'))
                 given = extract_xml_text(name_node.find('given-names'))
@@ -173,33 +172,80 @@ if uploaded_pdf and uploaded_xml:
                     unmapped_xml_front.append(get_raw_xml(role_node))
 
     # ==========================================
-    # [Body - 본문 제목 (sec/title) 매칭]
+    # [Body - 본문 제목 (sec/title) 및 문단 (p) 매칭]
     # ==========================================
     body_node = root.find('.//body')
     if body_node is not None:
+        
+        # 1. 제목 (sec/title) 매칭
         for sec_node in body_node.findall('.//sec'):
             title_node = sec_node.find('title')
-            if title_node is None: continue
-            
-            xml_text = extract_xml_text(title_node)
+            if title_node is not None:
+                xml_text = extract_xml_text(title_node)
+                if xml_text:
+                    ratio, bbox, b_page = find_best_match(xml_text, extracted_pdf_texts)
+                    if ratio >= BODY_TITLE_THRESHOLD:
+                        mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page, "bbox": str([round(c, 2) for c in bbox]), "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                    else:
+                        mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
+                        unmapped_xml_body.append(get_raw_xml(title_node))
+        
+        # 2. 문단 (p) 매칭: 공백/엔터라인 제거 후 3글자 일치 확인 및 다중 블록 병합
+        for p_node in body_node.findall('.//p'):
+            xml_text = extract_xml_text(p_node)
             if not xml_text: continue
             
-            # get_similarity 함수 내부에서 이미 공백을 모두 제거하고 비교합니다.
-            ratio, bbox, b_page = find_best_match(xml_text, extracted_pdf_texts)
+            clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
+            if len(clean_xml) < 3: continue
             
-            if ratio >= BODY_THRESHOLD:
+            xml_prefix = clean_xml[:3]
+            best_match_ratio, best_bbox, best_page = 0, None, -1
+            
+            for i in range(len(extracted_pdf_texts)):
+                clean_pdf_block = extracted_pdf_texts[i]["text"].replace(" ", "").replace("\n", "").strip()
+                
+                # 시작 3글자가 일치하는 블록을 찾으면 누적 시작
+                if clean_pdf_block.startswith(xml_prefix):
+                    accumulated_text = ""
+                    min_x0, min_y0, max_x1, max_y1 = float('inf'), float('inf'), float('-inf'), float('-inf')
+                    match_page = extracted_pdf_texts[i]["page"]
+                    
+                    for j in range(i, len(extracted_pdf_texts)):
+                        # 페이지가 넘어가면 하나의 사각형으로 묶기 어려우므로 일단 현재 페이지 안에서만 병합
+                        if extracted_pdf_texts[j]["page"] != match_page:
+                            break
+                            
+                        accumulated_text += extracted_pdf_texts[j]["text"]
+                        bx0, by0, bx1, by1 = extracted_pdf_texts[j]["bbox"]
+                        min_x0 = min(min_x0, bx0)
+                        min_y0 = min(min_y0, by0)
+                        max_x1 = max(max_x1, bx1)
+                        max_y1 = max(max_y1, by1)
+                        
+                        ratio = get_similarity(xml_text, accumulated_text)
+                        
+                        if ratio > best_match_ratio:
+                            best_match_ratio = ratio
+                            best_bbox = [min_x0, min_y0, max_x1, max_y1]
+                            best_page = match_page
+                        
+                        # 텍스트가 너무 길어지면 무의미하므로 중단
+                        if len(accumulated_text.replace(" ", "").replace("\n", "")) > len(clean_xml) * 1.5:
+                            break
+            
+            if best_match_ratio >= BODY_P_THRESHOLD:
                 mapped_data.append({
-                    "category": "Body", "tag": "sec/title", "xml_text": xml_text, 
-                    "page": b_page, "bbox": str([round(c, 2) for c in bbox]), 
-                    "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"
+                    "category": "Body", "tag": "p", "xml_text": xml_text,
+                    "page": best_page, "bbox": str([round(c, 2) for c in best_bbox]),
+                    "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"
                 })
             else:
                 mapped_data.append({
-                    "category": "Body", "tag": "sec/title", "xml_text": xml_text, 
-                    "page": b_page if b_page != -1 else 0, "bbox": "None", 
-                    "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"
+                    "category": "Body", "tag": "p", "xml_text": xml_text,
+                    "page": best_page if best_page != -1 else 0, "bbox": "None",
+                    "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"
                 })
-                unmapped_xml_body.append(get_raw_xml(title_node))
+                unmapped_xml_body.append(get_raw_xml(p_node))
 
     # ==========================================
     # [Back - 참고문헌 다중 블록 매칭]
@@ -257,17 +303,9 @@ if uploaded_pdf and uploaded_xml:
                             break
             
             if best_match_ratio >= BACK_THRESHOLD:
-                mapped_data.append({
-                    "category": "Back", "tag": "annotation", "xml_text": xml_text,
-                    "page": best_page, "bbox": str([round(c, 2) for c in best_bbox]),
-                    "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"
-                })
+                mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": best_page, "bbox": str([round(c, 2) for c in best_bbox]), "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             else:
-                mapped_data.append({
-                    "category": "Back", "tag": "annotation", "xml_text": xml_text,
-                    "page": best_page if best_page != -1 else 0, "bbox": "None",
-                    "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"
-                })
+                mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": best_page if best_page != -1 else 0, "bbox": "None", "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                 unmapped_xml_back.append(get_raw_xml(ref))
 
     df = pd.DataFrame(mapped_data)
@@ -277,13 +315,11 @@ if uploaded_pdf and uploaded_xml:
     st.markdown("---")
     col_img, col_data = st.columns([5, 5])
     
-    # 우측 패널
     with col_data:
         with st.container(height=850):
             st.subheader("📊 영역별 매칭 데이터 검수")
-            tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (본문 제목)", "Back (참고문헌)"])
+            tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (본문)", "Back (참고문헌)"])
             
-            # [Front 탭]
             with tab_front:
                 if not df.empty and "Front" in df["category"].values:
                     df_front = df[df["category"] == "Front"].reset_index(drop=True)
@@ -296,14 +332,12 @@ if uploaded_pdf and uploaded_xml:
                                 st.session_state.target_page = target_p
                                 st.rerun()
                                 
-            # [Body 탭] 추가된 영역
             with tab_body:
                 if not df.empty and "Body" in df["category"].values:
                     df_body = df[df["category"] == "Body"].reset_index(drop=True)
                     event_body = st.dataframe(df_body, use_container_width=True, height=200, on_select="rerun", selection_mode="single-row", key="df_body_tab")
                     if len(event_body.selection.rows) > 0 and selected_row_data is None:
                         selected_row_data = df_body.iloc[event_body.selection.rows[0]].to_dict()
-                        # 자동 페이지 이동 로직
                         if selected_row_data['bbox'] != "None":
                             target_p = int(selected_row_data['page'])
                             if target_p != st.session_state.target_page:
@@ -312,7 +346,6 @@ if uploaded_pdf and uploaded_xml:
                 else:
                     st.info("매핑된 Body 데이터가 없습니다.")
                 
-            # [Back 탭]
             with tab_back:
                 if not df.empty and "Back" in df["category"].values:
                     df_back = df[df["category"] == "Back"].reset_index(drop=True)
@@ -340,7 +373,7 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_body:
                     for raw in unmapped_xml_body: st.code(raw, language="xml")
                 else:
-                    st.success("추출된 Body 제목 정보가 모두 매핑되었습니다.")
+                    st.success("추출된 Body 제목/문단 정보가 모두 매핑되었습니다.")
             with tab_bk_fail:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
