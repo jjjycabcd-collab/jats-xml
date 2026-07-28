@@ -14,14 +14,14 @@ st.set_page_config(layout="wide", page_title="JATS XML-PDF 라벨링 검수 툴"
 st.title("JATS XML - PDF 저자 및 참고문헌 매칭 검수 도구")
 st.markdown("XML 데이터를 기준으로 PDF 텍스트와 유사도를 비교하여 바운딩 박스를 추출합니다.")
 
-# 사용자가 UI 상에서 임계값을 직접 조절할 수 있도록 사이드바에 배치
+# 사이드바 매칭 임계값 설정
 st.sidebar.header("매칭 임계값 설정 (Threshold)")
 FRONT_THRESHOLD = st.sidebar.slider("Front (저자) 매칭 기준", 0.0, 1.0, 0.70, 0.05)
-# 참고문헌 특성(텍스트 깨짐, 줄바꿈)을 고려하여 기본값을 0.70으로 완화
-BACK_THRESHOLD = st.sidebar.slider("Back (참고문헌) 매칭 기준", 0.0, 1.0, 0.70, 0.05) 
+# 요청사항 반영: 참고문헌 기본값을 0.65 (65%)로 하향 조정
+BACK_THRESHOLD = st.sidebar.slider("Back (참고문헌) 매칭 기준", 0.0, 1.0, 0.65, 0.05) 
 
 def get_similarity(text1, text2):
-    """두 문자열 간의 유사도를 0.0 ~ 1.0 사이로 반환 (공백 무시)"""
+    """두 문자열 간의 유사도를 0.0 ~ 1.0 사이로 반환 (공백/줄바꿈 무시)"""
     if not text1 or not text2:
         return 0.0
     t1 = text1.replace(" ", "").replace("\n", "").strip()
@@ -61,12 +61,11 @@ if uploaded_pdf and uploaded_xml:
     page_num = st.sidebar.number_input(f"페이지 번호 (0 ~ {len(doc)-1})", min_value=0, max_value=len(doc)-1, value=0)
     page = doc[page_num]
     
-    # 1. PDF 텍스트 블록 및 좌표 추출 (간단한 전처리 포함)
+    # 1. PDF 텍스트 블록 및 좌표 추출
     pdf_blocks = page.get_text("dict")["blocks"]
     extracted_pdf_texts = []
     for b in pdf_blocks:
         if "lines" in b:
-            # 하이픈 줄바꿈을 어느 정도 보정하여 텍스트 결합
             block_text = "".join([span["text"] for line in b["lines"] for span in line["spans"]])
             block_text = block_text.replace("- ", "").replace("-\n", "")
             extracted_pdf_texts.append({"text": block_text, "bbox": b["bbox"]})
@@ -76,7 +75,9 @@ if uploaded_pdf and uploaded_xml:
     unmapped_xml_front = []
     unmapped_xml_back = []
     
+    # ==========================================
     # [Front - 저자 정보 매칭]
+    # ==========================================
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
@@ -104,7 +105,9 @@ if uploaded_pdf and uploaded_xml:
                 })
                 unmapped_xml_front.append(get_raw_xml(contrib))
 
-    # [Back - 참고문헌 매칭]
+    # ==========================================
+    # [Back - 참고문헌 매칭] - 고도화된 다중 블록 병합 로직
+    # ==========================================
     back_node = root.find('.//back')
     if back_node is not None:
         for ref in back_node.findall('.//ref'):
@@ -113,14 +116,47 @@ if uploaded_pdf and uploaded_xml:
                 
             xml_text = extract_xml_text(annotation)
             if not xml_text: continue
-                
-            best_match_ratio, best_bbox = 0, None
-            for pdf_item in extracted_pdf_texts:
-                ratio = get_similarity(xml_text, pdf_item["text"])
-                if ratio > best_match_ratio:
-                    best_match_ratio = ratio
-                    best_bbox = pdf_item["bbox"]
             
+            clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
+            if len(clean_xml) < 3: continue
+            
+            # 조건 2: 3글자 시작점 확인을 위한 Prefix 추출
+            xml_prefix = clean_xml[:3]
+                
+            best_match_ratio = 0
+            best_bbox = None
+            
+            # 추출된 PDF 블록을 순회하며 시작점 찾기
+            for i in range(len(extracted_pdf_texts)):
+                clean_pdf_block = extracted_pdf_texts[i]["text"].replace(" ", "").replace("\n", "").strip()
+                
+                # 시작 3글자가 일치하는 블록을 찾으면 누적 시작
+                if clean_pdf_block.startswith(xml_prefix):
+                    accumulated_text = ""
+                    # Bounding Box 병합을 위한 최소/최대 좌표 초기화
+                    min_x0, min_y0, max_x1, max_y1 = float('inf'), float('inf'), float('-inf'), float('-inf')
+                    
+                    for j in range(i, len(extracted_pdf_texts)):
+                        accumulated_text += extracted_pdf_texts[j]["text"]
+                        
+                        # 현재 블록의 좌표를 포함하여 바운딩 박스 영역 확장
+                        bx0, by0, bx1, by1 = extracted_pdf_texts[j]["bbox"]
+                        min_x0 = min(min_x0, bx0)
+                        min_y0 = min(min_y0, by0)
+                        max_x1 = max(max_x1, bx1)
+                        max_y1 = max(max_y1, by1)
+                        
+                        ratio = get_similarity(xml_text, accumulated_text)
+                        
+                        if ratio > best_match_ratio:
+                            best_match_ratio = ratio
+                            best_bbox = [min_x0, min_y0, max_x1, max_y1]
+                        
+                        # 누적된 텍스트 길이가 원본 XML 텍스트 길이의 1.5배를 초과하면 무의미하므로 중단
+                        if len(accumulated_text.replace(" ", "")) > len(clean_xml) * 1.5:
+                            break
+            
+            # 조건 1: 최고 유사도가 65% 이상인지 검증
             if best_match_ratio >= BACK_THRESHOLD:
                 mapped_data.append({
                     "category": "Back", "tag": "annotation", "xml_text": xml_text,
@@ -142,7 +178,7 @@ if uploaded_pdf and uploaded_xml:
     st.markdown("---")
     col_img, col_data = st.columns([5, 5])
     
-    # 우측 패널: 데이터 탭 및 결과 (고정 높이 컨테이너 적용)
+    # 우측 패널
     with col_data:
         with st.container(height=850):
             st.subheader("📊 영역별 매칭 데이터 (Front & Back)")
@@ -183,7 +219,7 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
-    # 좌측 패널: PDF 시각화 (고정 높이 컨테이너 적용)
+    # 좌측 패널
     with col_img:
         with st.container(height=850):
             st.subheader(f"📄 PDF 시각화 (Page {page_num})")
