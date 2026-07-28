@@ -5,144 +5,190 @@ import xml.etree.ElementTree as ET
 import json
 import pandas as pd
 import ast
+import difflib
 
-# 페이지 기본 설정 (와이드 레이아웃)
+# ---------------------------------------------------------
+# 설정 및 헬퍼 함수
+# ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="JATS XML-PDF 라벨링 검수 툴")
-st.title("JATS XML - PDF 태깅 시각화 및 검수 도구")
-st.markdown("PDF 원문과 JATS XML 데이터를 매칭하여 바운딩 박스를 시각적으로 확인합니다.")
+st.title("JATS XML - PDF 저자 정보 매칭 및 검수 도구")
+st.markdown("XML 데이터를 기준으로 PDF 텍스트와 유사도를 비교하여 바운딩 박스를 추출합니다.")
 
-# 1. 파일 업로드 창 2개 나란히 배치
+def get_similarity(text1, text2):
+    """두 문자열 간의 유사도를 0.0 ~ 1.0 사이로 반환 (공백 무시)"""
+    if not text1 or not text2:
+        return 0.0
+    t1 = text1.replace(" ", "").replace("\n", "").strip()
+    t2 = text2.replace(" ", "").replace("\n", "").strip()
+    return difflib.SequenceMatcher(None, t1, t2).ratio()
+
+def extract_xml_text(element):
+    """XML 엘리먼트 내의 모든 텍스트를 재귀적으로 추출"""
+    return "".join(element.itertext()).strip()
+
+def get_raw_xml(element):
+    """XML 엘리먼트를 원시 문자열로 변환"""
+    if element is None:
+        return ""
+    # 유니코드 디코딩 시 발생할 수 있는 에러 방지
+    return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
+
+# ---------------------------------------------------------
+# 메인 로직
+# ---------------------------------------------------------
 col_up1, col_up2 = st.columns(2)
 with col_up1:
     uploaded_pdf = st.file_uploader("PDF 원문 파일을 업로드하세요", type=["pdf"])
 with col_up2:
     uploaded_xml = st.file_uploader("JATS XML 파일을 업로드하세요", type=["xml"])
 
-# 2. 두 파일이 모두 업로드되었을 때만 핵심 로직 실행
 if uploaded_pdf and uploaded_xml:
-    
-    # XML 파싱 테스트
     try:
         tree = ET.parse(uploaded_xml)
         root = tree.getroot()
-        st.success("✅ XML 및 PDF 파일이 성공적으로 로드되었습니다.")
+        st.success("✅ 파일이 성공적으로 로드되었습니다. Front(저자 정보) 매칭을 시작합니다.")
     except Exception as e:
-        st.error(f"❌ XML 파일을 읽는 중 오류가 발생했습니다: {e}")
-        st.stop() 
+        st.error(f"❌ XML 파싱 오류: {e}")
+        st.stop()
 
-    # PyMuPDF로 PDF 스트림 읽기
     doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
     
-    # 사이드바: 페이지 네비게이션
     st.sidebar.header("네비게이션")
-    page_num = st.sidebar.number_input(
-        f"페이지 번호 (0 ~ {len(doc)-1})", 
-        min_value=0, 
-        max_value=len(doc)-1, 
-        value=0
-    )
+    page_num = st.sidebar.number_input(f"페이지 번호 (0 ~ {len(doc)-1})", min_value=0, max_value=len(doc)-1, value=0)
     page = doc[page_num]
     
-    st.markdown("---")
-    # 3. 화면 분할 출력
-    col_img, col_data = st.columns([5, 5]) 
+    # 1. PDF 텍스트 블록 및 좌표 추출
+    pdf_blocks = page.get_text("dict")["blocks"]
+    extracted_pdf_texts = []
+    for b in pdf_blocks:
+        if "lines" in b:
+            block_text = "".join([span["text"] for line in b["lines"] for span in line["spans"]])
+            extracted_pdf_texts.append({"text": block_text, "bbox": b["bbox"]})
+
+    # 2. XML Front 영역 저자(contrib) 정보 파싱 및 매칭
+    mapped_data = []
+    unmapped_xml_front = []
     
-    # 가상의 샘플 매칭 데이터 (실제 데이터로 교체 필요)
-    # 반영: 저자소개(bio) 제외, 참고문헌(ref-list) 우선 추출 규칙 적용
-    sample_data = [
-        {"category": "Front", "tag": "journal-title", "text": "Journal of Korean Library and Information Science Society", "page": 0, "bbox": "[70, 80, 450, 100]", "status": "✅ 99%"},
-        {"category": "Front", "tag": "article-title", "text": "공공도서관 장서개발에 영향을 미치는 요인 분석에 관한 연구", "page": 0, "bbox": "[100, 150, 500, 180]", "status": "✅ 98%"},
-        {"category": "Front", "tag": "contrib", "text": "박윤서, 남영준", "page": 0, "bbox": "[350, 200, 480, 220]", "status": "✅ 95%"},
-        {"category": "Front", "tag": "abstract", "text": "본 연구의 목적은 공공도서관 장서개발에 영향을 미치는 요인을 분석하기 위함이다...", "page": 0, "bbox": "[70, 250, 500, 350]", "status": "⚠️ 줄바꿈 오류"},
-        {"category": "Front", "tag": "kwd-group", "text": "공공도서관, 장서개발, 사서, 도서, 참고정보원, 영향요인", "page": 0, "bbox": "[70, 360, 500, 380]", "status": "✅ 100%"},
-        {"category": "Body", "tag": "sec", "text": "1. 서론", "page": 0, "bbox": "[70, 400, 200, 420]", "status": "✅ 100%"},
-        {"category": "Body", "tag": "p", "text": "지식정보사회의 도래와 함께 도서관의 역할이 크게 변화하고 있다...", "page": 0, "bbox": "[70, 430, 500, 550]", "status": "✅ 96%"},
-        {"category": "Back", "tag": "ref-list", "text": "박윤서 (2020). 장서평가론. 한국도서관협회.", "page": 0, "bbox": "[70, 600, 500, 650]", "status": "✅ 100%"} 
-    ]
-    
-    df = pd.DataFrame(sample_data)
+    front_node = root.find('.//front')
+    if front_node is not None:
+        # 저자 정보(contrib) 추출
+        for contrib in front_node.findall('.//contrib'):
+            xml_text = extract_xml_text(contrib)
+            if not xml_text:
+                continue
+                
+            # PDF 블록들과 유사도 비교
+            best_match_ratio = 0
+            best_bbox = None
+            
+            for pdf_item in extracted_pdf_texts:
+                ratio = get_similarity(xml_text, pdf_item["text"])
+                if ratio > best_match_ratio:
+                    best_match_ratio = ratio
+                    best_bbox = pdf_item["bbox"]
+            
+            # 임계치(예: 70%) 이상일 경우 매핑 성공으로 간주
+            SIMILARITY_THRESHOLD = 0.7
+            if best_match_ratio >= SIMILARITY_THRESHOLD:
+                mapped_data.append({
+                    "category": "Front",
+                    "tag": "contrib (저자)",
+                    "xml_text": xml_text,
+                    "page": page_num,
+                    "bbox": str([round(c, 2) for c in best_bbox]),
+                    "similarity": f"{best_match_ratio * 100:.1f}%",
+                    "status": "✅ 매칭 완료"
+                })
+            else:
+                mapped_data.append({
+                    "category": "Front",
+                    "tag": "contrib (저자)",
+                    "xml_text": xml_text,
+                    "page": page_num,
+                    "bbox": "None",
+                    "similarity": f"{best_match_ratio * 100:.1f}%",
+                    "status": "❌ 매핑 실패"
+                })
+                # 매핑 실패한 XML 노드는 미처리 목록에 추가
+                unmapped_xml_front.append(get_raw_xml(contrib))
+
+    df = pd.DataFrame(mapped_data)
     selected_row_data = None
 
-    # 우측 패널: 데이터 탭 분리 및 선택 로직
+    # 3. 화면 분할 (좌: PDF, 우: 데이터 표)
+    st.markdown("---")
+    col_img, col_data = st.columns([5, 5])
+    
     with col_data:
-        st.subheader("📊 JATS 1.3 매칭 데이터 상세 검수")
+        st.subheader("📊 Front 영역 매칭 데이터 (저자 정보 중심)")
+        st.caption("XML의 저자 텍스트를 기준으로 PDF 텍스트와 유사도를 비교하여 좌표를 찾습니다.")
         
-        # JATS 구조에 따른 탭 생성
-        tab_front, tab_body, tab_back = st.tabs(["Front (메타)", "Body (본문)", "Back (참고문헌 등)"])
-        
-        # Front 탭
-        with tab_front:
-            df_front = df[df["category"] == "Front"].reset_index(drop=True)
-            event_front = st.dataframe(df_front, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row")
-            if len(event_front.selection.rows) > 0:
-                selected_row_data = df_front.iloc[event_front.selection.rows[0]].to_dict()
-                
-        # Body 탭
-        with tab_body:
-            df_body = df[df["category"] == "Body"].reset_index(drop=True)
-            event_body = st.dataframe(df_body, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row")
-            if len(event_body.selection.rows) > 0:
-                selected_row_data = df_body.iloc[event_body.selection.rows[0]].to_dict()
-                
-        # Back 탭
-        with tab_back:
-            df_back = df[df["category"] == "Back"].reset_index(drop=True)
-            event_back = st.dataframe(df_back, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row")
-            if len(event_back.selection.rows) > 0:
-                selected_row_data = df_back.iloc[event_back.selection.rows[0]].to_dict()
-
-        st.markdown("---")
-        st.markdown("##### 📌 선택된 추출 정보 전체 데이터")
-        
-        # 부분 스크롤이 적용되는 고정 높이 컨테이너 생성
+        # 상단: 데이터 테이블 렌더링 및 선택 이벤트 캡처
+        if not df.empty:
+            event = st.dataframe(
+                df,
+                use_container_width=True,
+                height=200,
+                on_select="rerun",
+                selection_mode="single-row"
+            )
+            
+            if len(event.selection.rows) > 0:
+                selected_idx = event.selection.rows[0]
+                selected_row_data = df.iloc[selected_idx].to_dict()
+        else:
+            st.warning("현재 페이지에서 매핑된 Front(저자) 정보가 없습니다.")
+            
+        # 하단: 선택된 행의 전체 JSON 상세 출력
+        st.markdown("<br>##### 📌 선택된 추출 정보 전체 데이터", unsafe_allow_html=True)
         json_container = st.container(height=200)
         with json_container:
             if selected_row_data:
-                st.json(selected_row_data) # 생략 없이 전체 내용 출력
+                st.json(selected_row_data)
             else:
-                st.info("위 탭의 데이터 테이블에서 행을 클릭하면 해당 데이터의 상세 정보가 이곳에 표시됩니다.")
+                st.info("👆 위 테이블에서 행을 클릭하면 전체 매핑 정보가 이곳에 출력됩니다.")
                 
-        st.markdown("---")
-        # JSON 다운로드 버튼
-        json_data_str = json.dumps(sample_data, ensure_ascii=False, indent=2)
-        st.download_button(
-            label="📥 학습용 JSON 데이터세트 다운로드",
-            data=json_data_str,
-            file_name="labeled_jats_data.json",
-            mime="application/json",
-            type="primary"
-        )
+        # 미매핑 / 미처리 XML 데이터 출력 (Front 실패건, Body, Back 전체)
+        st.markdown("<br>##### ⚠️ 매핑 실패 및 미처리 XML 데이터", unsafe_allow_html=True)
+        
+        tab_f, tab_b, tab_bk = st.tabs(["Front (매핑 실패)", "Body (미처리)", "Back (미처리)"])
+        with tab_f:
+            if unmapped_xml_front:
+                for raw_xml in unmapped_xml_front:
+                    st.code(raw_xml, language="xml")
+            else:
+                st.success("Front 영역의 저자 정보가 모두 매핑되었습니다.")
+                
+        with tab_b:
+            body_node = root.find('.//body')
+            if body_node is not None:
+                st.code(get_raw_xml(body_node), language="xml")
+            else:
+                st.info("Body 영역이 없습니다.")
+                
+        with tab_bk:
+            back_node = root.find('.//back')
+            if back_node is not None:
+                st.code(get_raw_xml(back_node), language="xml")
+            else:
+                st.info("Back 영역이 없습니다.")
 
-    # 좌측 패널: PDF 시각화 및 클릭 시 바운딩 박스 강조
     with col_img:
         st.subheader(f"📄 PDF 시각화 (Page {page_num})")
         
-        # 해상도를 높여 PDF 렌더링
         zoom = 2.0  
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         draw = ImageDraw.Draw(img)
         
-        # 1. 탭/선택 여부와 무관하게 모든 바운딩 박스를 붉은색으로 그리기
-        for idx, row in df.iterrows():
-            bbox_str = row['bbox']
-            if bbox_str != "None" and row['page'] == page_num:
-                try:
-                    bbox = ast.literal_eval(bbox_str)
-                    scaled_bbox = [b * zoom for b in bbox]
-                    draw.rectangle(scaled_bbox, outline="red", width=2)
-                except:
-                    pass
-                
-        # 2. 행이 클릭(선택)된 경우 파란색 두꺼운 박스로 덮어 그리기
+        # 선택된 데이터가 있고, 좌표가 존재할 경우 파란색 박스로 시각화
         if selected_row_data and selected_row_data['bbox'] != "None" and selected_row_data['page'] == page_num:
             try:
                 bbox = ast.literal_eval(selected_row_data['bbox'])
                 scaled_bbox = [b * zoom for b in bbox]
                 draw.rectangle(scaled_bbox, outline="blue", width=5)
-            except:
+            except Exception as e:
                 pass
-            
+                
         st.image(img, use_container_width=True)
-        st.caption("※ 알림: 좌표가 원문과 맞지 않는다면, 코드 내 `sample_data`의 임의 좌표가 화면에 표시되었기 때문입니다. 실제 추출 좌표가 연동되면 정상적으로 그려집니다.")
