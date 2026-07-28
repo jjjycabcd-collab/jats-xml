@@ -177,7 +177,6 @@ if uploaded_pdf and uploaded_xml:
     body_node = root.find('.//body')
     if body_node is not None:
         
-        # 1. 제목 (sec/title) 매칭
         for sec_node in body_node.findall('.//sec'):
             title_node = sec_node.find('title')
             if title_node is not None:
@@ -190,7 +189,6 @@ if uploaded_pdf and uploaded_xml:
                         mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
                         unmapped_xml_body.append(get_raw_xml(title_node))
         
-        # 2. 문단 (p) 매칭
         for p_node in body_node.findall('.//p'):
             xml_text = extract_xml_text(p_node)
             if not xml_text: continue
@@ -315,29 +313,23 @@ if uploaded_pdf and uploaded_xml:
             page = row['page']
             bbox_str = row['bbox']
             if bbox_str == "None":
-                return page, 9999, 9999  # 매핑 실패 항목은 맨 뒤로 배치
+                return page, 9999, 9999
             try:
                 bbox = ast.literal_eval(bbox_str)
                 x0, y0, x1, y1 = bbox
-                
                 width = x1 - x0
-                # A4 용지 기준 중앙(약 300px)을 좌우 단으로 나누는 임계값으로 설정
-                # 가운데 정렬된 제목이나 넓은 텍스트(width > 250)는 무조건 우선(col=0) 배정
                 if width > 250 or x0 < 300:
                     col = 0
                 else:
                     col = 1
-                    
                 return page, col, y0
             except:
                 return page, 9999, 9999
 
-        # 정렬용 임시 컬럼 생성
         df['sort_page'] = df.apply(lambda x: get_sort_keys(x)[0], axis=1)
         df['sort_col']  = df.apply(lambda x: get_sort_keys(x)[1], axis=1)
         df['sort_y0']   = df.apply(lambda x: get_sort_keys(x)[2], axis=1)
         
-        # 페이지 -> 단(가로) -> 세로 위치 순으로 정렬
         df = df.sort_values(by=['sort_page', 'sort_col', 'sort_y0'])
         df = df.drop(columns=['sort_page', 'sort_col', 'sort_y0']).reset_index(drop=True)
 
@@ -347,6 +339,7 @@ if uploaded_pdf and uploaded_xml:
     st.markdown("---")
     col_img, col_data = st.columns([5, 5])
     
+    # 우측 패널 (데이터 테이블)
     with col_data:
         with st.container(height=850):
             st.subheader("📊 영역별 매칭 데이터 검수")
@@ -410,12 +403,28 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
-    # 좌측 패널
+    # 좌측 패널 (PDF 렌더링 및 페이지 이동 버튼)
     with col_img:
         with st.container(height=850):
-            st.subheader(f"📄 PDF 시각화 (Page {page_num})")
+            # 상단 페이지 이동 내비게이션 버튼 배치
+            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+            with nav_col1:
+                if st.button("◀ 이전 페이지", use_container_width=True):
+                    if st.session_state.target_page > 0:
+                        st.session_state.target_page -= 1
+                        st.rerun()
+            with nav_col2:
+                st.markdown(f"<h4 style='text-align: center; margin-top: 0px;'>📄 PDF 시각화 (Page {page_num})</h4>", unsafe_allow_html=True)
+            with nav_col3:
+                if st.button("다음 페이지 ▶", use_container_width=True):
+                    if st.session_state.target_page < len(doc) - 1:
+                        st.session_state.target_page += 1
+                        st.rerun()
             
-            zoom = 2.0  
+            st.divider() # 네비게이션 버튼과 PDF 시각화 영역 구분
+            
+            # 확대 비율을 2.5로 높여 PDF를 더 크게 렌더링 (컨테이너 내 스크롤바 생성 유도)
+            zoom = 2.5
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -431,4 +440,5 @@ if uploaded_pdf and uploaded_xml:
             elif selected_row_data and selected_row_data.get('bbox') == "None":
                 st.warning("⚠️ 선택된 항목은 매핑에 실패하여 좌표(bbox) 정보가 존재하지 않습니다.")
                     
+            # use_container_width를 통해 너비는 맞추되, 세로로 긴 이미지가 되어 전체 페이지 상하 스크롤이 활성화됨
             st.image(img, use_container_width=True)
