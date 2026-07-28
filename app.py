@@ -22,7 +22,7 @@ except ImportError:
 # ---------------------------------------------------------
 st.set_page_config(layout="wide", page_title="JATS XML-PDF 라벨링 검수 툴")
 st.title("JATS XML - PDF 태깅 시각화 및 검수 도구")
-st.markdown("XML 데이터를 기준으로 PDF 전체 텍스트를 탐색하여 바운딩 박스를 추출합니다.")
+st.markdown("XML 데이터를 기준으로 단(Column)과 페이지(Page)를 넘나드는 문단을 정교하게 분리하여 매핑합니다.")
 
 st.sidebar.header("매칭 임계값 설정 (Threshold)")
 FRONT_THRESHOLD = st.sidebar.slider("Front (저자 항목별) 매칭 기준", 0.0, 1.0, 0.70, 0.05)
@@ -45,34 +45,54 @@ def get_raw_xml(element):
     if element is None: return ""
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
-def merge_bboxes(bboxes):
-    """다중 라인의 바운딩 박스를 같은 단(Column)끼리 타이트하게 병합"""
-    if not bboxes: return []
+# [신규] 단(Column) 및 페이지(Page) 전환 시 박스를 분리하는 핵심 함수
+def merge_multi_page_bboxes(blocks):
+    """
+    blocks: [{"page": p, "bbox": [x0, y0, x1, y1]}, ...]
+    Returns: [[page, x0, y0, x1, y1], [page, x0, y0, x1, y1], ...]
+    """
+    if not blocks: return []
     merged = []
-    curr = list(bboxes[0])
-    for b in bboxes[1:]:
-        center_curr = (curr[0] + curr[2]) / 2
-        center_b = (b[0] + b[2]) / 2
+    
+    curr_page = blocks[0]["page"]
+    curr_bbox = list(blocks[0]["bbox"])
+    
+    for b in blocks[1:]:
+        p = b["page"]
+        box = b["bbox"]
+        
+        # 단(Column) 판단 기준
+        center_curr = (curr_bbox[0] + curr_bbox[2]) / 2
+        center_b = (box[0] + box[2]) / 2
         col_curr = 0 if center_curr < 300 else 1
         col_b = 0 if center_b < 300 else 1
         
-        if col_curr == col_b: # 같은 단에 속하면 영역 확장
-            curr[0], curr[1] = min(curr[0], b[0]), min(curr[1], b[1])
-            curr[2], curr[3] = max(curr[2], b[2]), max(curr[3], b[3])
-        else: # 단을 넘어가면 새로운 박스로 분리 생성
-            merged.append([round(c, 2) for c in curr])
-            curr = list(b)
-    merged.append([round(c, 2) for c in curr])
+        # y축 거리 판단 (단락 내 거리가 너무 멀면 분리, 예: 150px)
+        y_gap = box[1] - curr_bbox[3]
+        
+        # 같은 페이지, 같은 단, 너무 멀지 않은 거리일 때만 영역 병합
+        if p == curr_page and col_curr == col_b and y_gap < 150:
+            curr_bbox[0] = min(curr_bbox[0], box[0])
+            curr_bbox[1] = min(curr_bbox[1], box[1])
+            curr_bbox[2] = max(curr_bbox[2], box[2])
+            curr_bbox[3] = max(curr_bbox[3], box[3])
+        else:
+            # 단이 넘어가거나 페이지가 넘어가면 기존 박스를 저장하고 새 박스 시작
+            merged.append([curr_page] + [round(c, 2) for c in curr_bbox])
+            curr_page = p
+            curr_bbox = list(box)
+            
+    merged.append([curr_page] + [round(c, 2) for c in curr_bbox])
     return merged
 
 def find_best_match(xml_text, pdf_texts):
-    """(단일 라인용) Front 메타 정보 검색"""
+    """(단일 라인용) Front 메타 정보 검색 - 다중 박스 포맷 통일 [[page, x0, y0, x1, y1]]"""
     best_match_ratio, best_bbox, best_page = 0, None, -1
     for pdf_item in pdf_texts:
         ratio = get_similarity(xml_text, pdf_item["text"])
         if ratio > best_match_ratio:
             best_match_ratio = ratio
-            best_bbox = [[round(c, 2) for c in pdf_item["bbox"]]]
+            best_bbox = [[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]]
             best_page = pdf_item["page"]
     return best_match_ratio, str(best_bbox) if best_bbox else "None", best_page
 
@@ -81,42 +101,40 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
     if not xml_text: return 0, "None", -1
     
     clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
-    clean_xml_for_prefix = re.sub(r'^[^\w가-힣]+', '', clean_xml) # 시작 특수기호 제거
+    clean_xml_for_prefix = re.sub(r'^[^\w가-힣]+', '', clean_xml)
     xml_prefix = clean_xml_for_prefix[:3] if len(clean_xml_for_prefix) >= 3 else clean_xml_for_prefix
         
-    best_match_ratio, best_bboxes, best_page = 0, [], -1
+    best_match_ratio, best_blocks, best_start_page = 0, [], -1
     
     for i in range(len(pdf_texts)):
         clean_pdf_block = re.sub(r'^[^\w가-힣]+', '', pdf_texts[i]["text"].replace(" ", "").replace("\n", "").strip())
         
         if not xml_prefix or clean_pdf_block.startswith(xml_prefix):
             accumulated_text = ""
-            current_bboxes = []
-            match_page = pdf_texts[i]["page"]
+            current_blocks = []
+            start_page = pdf_texts[i]["page"]
             
             for j in range(i, len(pdf_texts)):
-                if pdf_texts[j]["page"] != match_page: break # 페이지가 넘어가면 누적 중단
-                
                 accumulated_text += pdf_texts[j]["text"]
-                current_bboxes.append(pdf_texts[j]["bbox"])
+                current_blocks.append({"page": pdf_texts[j]["page"], "bbox": pdf_texts[j]["bbox"]})
                 
                 current_clean_acc = accumulated_text.replace(" ", "").replace("\n", "").strip()
                 ratio = get_similarity(clean_xml, current_clean_acc)
                 
                 if ratio > best_match_ratio:
                     best_match_ratio = ratio
-                    best_bboxes = list(current_bboxes)
-                    best_page = match_page
+                    best_blocks = list(current_blocks)
+                    best_start_page = start_page
                     
-                # [핵심] 단락의 원문 길이에 도달하면 즉시 중단하여 거대 박스 침범 방지
                 if len(current_clean_acc) >= len(clean_xml) + 5: 
                     break
     
     if best_match_ratio >= threshold:
-        merged = merge_bboxes(best_bboxes)
-        return best_match_ratio, str(merged), best_page
+        # 분리/병합 로직 적용
+        merged = merge_multi_page_bboxes(best_blocks)
+        return best_match_ratio, str(merged), best_start_page
     else:
-        return best_match_ratio, "None", best_page if best_page != -1 else 0
+        return best_match_ratio, "None", best_start_page if best_start_page != -1 else 0
 
 # ---------------------------------------------------------
 # 메인 로직
@@ -203,7 +221,7 @@ if uploaded_pdf and uploaded_xml:
                     max_ratio = max(get_similarity(format1, pdf_item["text"]), get_similarity(format2, pdf_item["text"]))
                     if max_ratio > best_match_ratio:
                         best_match_ratio = max_ratio
-                        best_bbox = str([[round(c, 2) for c in pdf_item["bbox"]]])
+                        best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]])
                         best_page = pdf_item["page"]
                 
                 xml_display_text = f"{given} {surname}".strip()
@@ -232,12 +250,11 @@ if uploaded_pdf and uploaded_xml:
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
     # ==========================================
-    # [Body - 본문 제목, 문단, 표/그림 제목 매칭]
+    # [Body - 본문 제목, 표, 그림, 단락 매칭]
     # ==========================================
     body_node = root.find('.//body')
     if body_node is not None:
         
-        # 1. 제목 (sec/title) 매칭
         for sec_node in body_node.findall('.//sec'):
             title_node = sec_node.find('title')
             if title_node is not None:
@@ -248,10 +265,8 @@ if uploaded_pdf and uploaded_xml:
                     if ratio >= BODY_TITLE_THRESHOLD: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                     else: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(title_node))
         
-        # 2. 표 (table-wrap) / 그림 (fig) 매칭
         for fig_table_node in body_node.findall('.//table-wrap') + body_node.findall('.//fig'):
             if should_exclude_body_node(fig_table_node): continue
-                
             tag_name = fig_table_node.tag
             label_node = fig_table_node.find('label')
             title_node = fig_table_node.find('.//caption/title')
@@ -263,10 +278,8 @@ if uploaded_pdf and uploaded_xml:
             if ratio >= BODY_FIG_TABLE_THRESHOLD: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(fig_table_node))
 
-        # 3. 문단 (p) 매칭
         for p_node in body_node.findall('.//p'):
             if should_exclude_body_node(p_node): continue
-                
             xml_text = extract_xml_text(p_node)
             ratio, bbox_str, b_page = find_accumulated_match(xml_text, extracted_pdf_texts, BODY_P_THRESHOLD)
             
@@ -274,7 +287,7 @@ if uploaded_pdf and uploaded_xml:
             elif xml_text: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(p_node))
 
     # ==========================================
-    # [Back - 참고문헌 다중 블록 매칭]
+    # [Back - 참고문헌 매칭]
     # ==========================================
     ref_start_idx = 0
     for i, item in enumerate(extracted_pdf_texts):
@@ -287,7 +300,6 @@ if uploaded_pdf and uploaded_xml:
         for ref in back_node.findall('.//ref'):
             annotation = ref.find('.//annotation')
             if annotation is None: continue
-            
             xml_text = extract_xml_text(annotation)
             ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_back, BACK_THRESHOLD)
             
@@ -295,7 +307,7 @@ if uploaded_pdf and uploaded_xml:
             elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
 
     # ==========================================
-    # [데이터 정렬 로직 (1단/2단 흐름 반영)]
+    # [데이터 정렬 로직]
     # ==========================================
     df = pd.DataFrame(mapped_data)
     if not df.empty:
@@ -304,13 +316,11 @@ if uploaded_pdf and uploaded_xml:
             if bbox_str == "None": return page, 9999, 9999
             try:
                 bbox_data = ast.literal_eval(bbox_str)
-                if isinstance(bbox_data[0], (list, tuple)): x0, y0, x1, y1 = bbox_data[0]
-                else: x0, y0, x1, y1 = bbox_data
-                
+                # 바운딩 박스가 여러 개(리스트의 리스트)일 경우 첫 번째 박스 기준
+                p, x0, y0, x1, y1 = bbox_data[0]
                 width = x1 - x0
-                if width > 250 or x0 < 300: col = 0
-                else: col = 1
-                return page, col, y0
+                col = 0 if width > 250 or x0 < 300 else 1
+                return p, col, y0
             except: return page, 9999, 9999
 
         df['sort_page'] = df.apply(lambda x: get_sort_keys(x)[0], axis=1)
@@ -371,7 +381,7 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
-    # [좌측 패널] PDF 시각화 (다중 박스 분리 렌더링 적용)
+    # [좌측 패널] PDF 시각화 (다중 박스 렌더링 지원)
     @fragment
     def render_pdf_viewer(doc, selected_row):
         nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
@@ -396,18 +406,15 @@ if uploaded_pdf and uploaded_xml:
                 pix = page.get_pixmap(matrix=mat)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 
-                if selected_row and selected_row.get('bbox') != "None" and int(selected_row.get('page')) == i:
+                if selected_row and selected_row.get('bbox') != "None":
                     try:
                         bbox_data = ast.literal_eval(selected_row['bbox'])
                         draw = ImageDraw.Draw(img)
-                        # 다중 박스인 경우 개별 박스들을 모두 그려 거대 박스 침범을 방지
-                        if isinstance(bbox_data[0], (list, tuple)):
-                            for b in bbox_data:
-                                scaled_bbox = [c * zoom for c in b]
+                        for b in bbox_data:
+                            # b 구조: [page, x0, y0, x1, y1]
+                            if b[0] == i:
+                                scaled_bbox = [c * zoom for c in b[1:]]
                                 draw.rectangle(scaled_bbox, outline="blue", width=3)
-                        else:
-                            scaled_bbox = [c * zoom for c in bbox_data]
-                            draw.rectangle(scaled_bbox, outline="blue", width=3)
                     except Exception:
                         pass
                         
