@@ -9,6 +9,7 @@ import difflib
 import re
 import streamlit.components.v1 as components
 
+# Streamlit 부분 재실행(Fragment) 데코레이터 호환성 처리
 try:
     from streamlit import fragment
 except ImportError:
@@ -45,48 +46,39 @@ def get_raw_xml(element):
     if element is None: return ""
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
-# [신규] 단(Column) 및 페이지(Page) 전환 시 박스를 분리하는 핵심 함수
 def merge_multi_page_bboxes(blocks):
     """
-    blocks: [{"page": p, "bbox": [x0, y0, x1, y1]}, ...]
-    Returns: [[page, x0, y0, x1, y1], [page, x0, y0, x1, y1], ...]
+    유효한 텍스트 줄(Line)들을 페이지(Page)와 단(Column)을 기준으로 타이트하게 병합합니다.
+    단이 넘어가면 억지로 합치지 않고 분리된 박스로 쪼갭니다.
     """
     if not blocks: return []
-    merged = []
-    
-    curr_page = blocks[0]["page"]
-    curr_bbox = list(blocks[0]["bbox"])
-    
-    for b in blocks[1:]:
+    groups = {}
+    for b in blocks:
         p = b["page"]
         box = b["bbox"]
         
-        # 단(Column) 판단 기준
-        center_curr = (curr_bbox[0] + curr_bbox[2]) / 2
-        center_b = (box[0] + box[2]) / 2
-        col_curr = 0 if center_curr < 300 else 1
-        col_b = 0 if center_b < 300 else 1
+        # 박스의 중심 x좌표를 기준으로 좌측 단(0)인지 우측 단(1)인지 판별 (A4 기준 300px)
+        center_x = (box[0] + box[2]) / 2
+        col = 0 if center_x < 300 else 1
         
-        # y축 거리 판단 (단락 내 거리가 너무 멀면 분리, 예: 150px)
-        y_gap = box[1] - curr_bbox[3]
-        
-        # 같은 페이지, 같은 단, 너무 멀지 않은 거리일 때만 영역 병합
-        if p == curr_page and col_curr == col_b and y_gap < 150:
-            curr_bbox[0] = min(curr_bbox[0], box[0])
-            curr_bbox[1] = min(curr_bbox[1], box[1])
-            curr_bbox[2] = max(curr_bbox[2], box[2])
-            curr_bbox[3] = max(curr_bbox[3], box[3])
+        key = (p, col)
+        if key not in groups:
+            groups[key] = list(box)
         else:
-            # 단이 넘어가거나 페이지가 넘어가면 기존 박스를 저장하고 새 박스 시작
-            merged.append([curr_page] + [round(c, 2) for c in curr_bbox])
-            curr_page = p
-            curr_bbox = list(box)
+            curr = groups[key]
+            curr[0] = min(curr[0], box[0])
+            curr[1] = min(curr[1], box[1])
+            curr[2] = max(curr[2], box[2])
+            curr[3] = max(curr[3], box[3])
             
-    merged.append([curr_page] + [round(c, 2) for c in curr_bbox])
+    merged = []
+    for (p, col), box in groups.items():
+        merged.append([p] + [round(c, 2) for c in box])
+        
+    merged.sort(key=lambda x: (x[0], x[1])) # 페이지, 단 순서대로 정렬
     return merged
 
 def find_best_match(xml_text, pdf_texts):
-    """(단일 라인용) Front 메타 정보 검색 - 다중 박스 포맷 통일 [[page, x0, y0, x1, y1]]"""
     best_match_ratio, best_bbox, best_page = 0, None, -1
     for pdf_item in pdf_texts:
         ratio = get_similarity(xml_text, pdf_item["text"])
@@ -97,7 +89,10 @@ def find_best_match(xml_text, pdf_texts):
     return best_match_ratio, str(best_bbox) if best_bbox else "None", best_page
 
 def find_accumulated_match(xml_text, pdf_texts, threshold):
-    """(다중 라인 누적용) Body, Back 본문 단락/참고문헌 정밀 검색"""
+    """
+    다중 블록을 누적 탐색하되, 실제로 일치하는 문자(Character)가 포함된 유효한 줄(Line)만 
+    걸러내어 거대 바운딩 박스 생성을 원천 차단합니다.
+    """
     if not xml_text: return 0, "None", -1
     
     clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
@@ -111,26 +106,58 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
         
         if not xml_prefix or clean_pdf_block.startswith(xml_prefix):
             accumulated_text = ""
-            current_blocks = []
-            start_page = pdf_texts[i]["page"]
+            current_lines = []
+            match_page = pdf_texts[i]["page"]
             
             for j in range(i, len(pdf_texts)):
-                accumulated_text += pdf_texts[j]["text"]
-                current_blocks.append({"page": pdf_texts[j]["page"], "bbox": pdf_texts[j]["bbox"]})
+                # 무한 루프 방지를 위해 2페이지 이상 차이나면 누적 중단
+                if pdf_texts[j]["page"] - match_page > 1: break
                 
-                current_clean_acc = accumulated_text.replace(" ", "").replace("\n", "").strip()
-                ratio = get_similarity(clean_xml, current_clean_acc)
+                line_clean = pdf_texts[j]["text"].replace(" ", "").replace("\n", "").strip()
+                if not line_clean: continue
+                
+                accumulated_text += line_clean
+                current_lines.append({
+                    "length": len(line_clean),
+                    "bbox": pdf_texts[j]["bbox"],
+                    "page": pdf_texts[j]["page"]
+                })
+                
+                ratio = get_similarity(clean_xml, accumulated_text)
                 
                 if ratio > best_match_ratio:
                     best_match_ratio = ratio
-                    best_blocks = list(current_blocks)
-                    best_start_page = start_page
+                    best_start_page = match_page
                     
-                if len(current_clean_acc) >= len(clean_xml) + 5: 
+                    # [핵심] SequenceMatcher를 이용해 실제 매칭된 문자의 위치를 역추적
+                    sm = difflib.SequenceMatcher(None, clean_xml, accumulated_text)
+                    matched_indices = set()
+                    for match in sm.get_matching_blocks():
+                        # 우연히 일치하는 가짜 텍스트(노이즈)를 무시하기 위해 3글자 이상 연속 매칭만 취급
+                        if match.size >= 3: 
+                            for idx in range(match.b, match.b + match.size):
+                                matched_indices.add(idx)
+                                
+                    valid_bboxes = []
+                    current_char_idx = 0
+                    for line_info in current_lines:
+                        line_len = line_info["length"]
+                        # 이 줄(Line)에서 원문과 일치한 글자 수 계산
+                        matched_in_line = sum(1 for k in range(current_char_idx, current_char_idx + line_len) if k in matched_indices)
+                        
+                        # 표(Table)나 푸터(Footer) 등 가짜 텍스트는 matched_in_line이 0이 되어 여기서 걸러짐!
+                        if matched_in_line >= max(1, int(line_len * 0.5)):
+                            valid_bboxes.append({"page": line_info["page"], "bbox": line_info["bbox"]})
+                            
+                        current_char_idx += line_len
+                        
+                    best_blocks = list(valid_bboxes)
+                    
+                # 중간에 표나 그림이 있더라도 통과할 수 있도록 최대 300자까지 누적 허용
+                if len(accumulated_text) >= len(clean_xml) + 300: 
                     break
-    
+                    
     if best_match_ratio >= threshold:
-        # 분리/병합 로직 적용
         merged = merge_multi_page_bboxes(best_blocks)
         return best_match_ratio, str(merged), best_start_page
     else:
@@ -180,7 +207,7 @@ if uploaded_pdf and uploaded_xml:
     
     if "pdf_view_page" not in st.session_state: st.session_state.pdf_view_page = 0
     
-    # 1. PDF 텍스트 추출 (Line-level 분해 적용)
+    # 1. PDF 텍스트 추출
     extracted_pdf_texts = []
     for p_num in range(len(doc)):
         p_blocks = doc[p_num].get_text("dict")["blocks"]
@@ -250,7 +277,7 @@ if uploaded_pdf and uploaded_xml:
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
     # ==========================================
-    # [Body - 본문 제목, 표, 그림, 단락 매칭]
+    # [Body - 본문 제목, 표/그림 제목, 단락 매칭]
     # ==========================================
     body_node = root.find('.//body')
     if body_node is not None:
@@ -307,7 +334,7 @@ if uploaded_pdf and uploaded_xml:
             elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
 
     # ==========================================
-    # [데이터 정렬 로직]
+    # [데이터 정렬 로직 (1단/2단 흐름 반영)]
     # ==========================================
     df = pd.DataFrame(mapped_data)
     if not df.empty:
@@ -316,7 +343,6 @@ if uploaded_pdf and uploaded_xml:
             if bbox_str == "None": return page, 9999, 9999
             try:
                 bbox_data = ast.literal_eval(bbox_str)
-                # 바운딩 박스가 여러 개(리스트의 리스트)일 경우 첫 번째 박스 기준
                 p, x0, y0, x1, y1 = bbox_data[0]
                 width = x1 - x0
                 col = 0 if width > 250 or x0 < 300 else 1
@@ -381,16 +407,16 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
-    # [좌측 패널] PDF 시각화 (다중 박스 렌더링 지원)
+    # [좌측 패널] PDF 시각화 (Fragment 기반 독립 렌더링 & 붉은색 타이트 박스 적용)
     @fragment
     def render_pdf_viewer(doc, selected_row):
         nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
         with nav_col1:
             if st.button("◀ 이전 페이지", use_container_width=True):
-                if st.session_state.pdf_view_page > 0: st.session_state.pdf_view_page -= 1; st.rerun()
+                if st.session_state.pdf_view_page > 0: st.session_state.pdf_view_page -= 1
         with nav_col3:
             if st.button("다음 페이지 ▶", use_container_width=True):
-                if st.session_state.pdf_view_page < len(doc) - 1: st.session_state.pdf_view_page += 1; st.rerun()
+                if st.session_state.pdf_view_page < len(doc) - 1: st.session_state.pdf_view_page += 1
         with nav_col2:
             st.markdown(f"<h4 style='text-align: center; margin-top: 0px;'>📄 PDF 시각화 (Page {st.session_state.pdf_view_page})</h4>", unsafe_allow_html=True)
             
@@ -414,7 +440,8 @@ if uploaded_pdf and uploaded_xml:
                             # b 구조: [page, x0, y0, x1, y1]
                             if b[0] == i:
                                 scaled_bbox = [c * zoom for c in b[1:]]
-                                draw.rectangle(scaled_bbox, outline="blue", width=3)
+                                # 요청하신 붉은색 2개의 박스로 확연하게 구분되어 그려집니다!
+                                draw.rectangle(scaled_bbox, outline="red", width=3)
                     except Exception:
                         pass
                         
