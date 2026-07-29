@@ -2,12 +2,10 @@ import streamlit as st
 import fitz  # PyMuPDF
 from PIL import Image, ImageDraw
 import xml.etree.ElementTree as ET
-import json
 import pandas as pd
 import ast
 import difflib
 import re
-import streamlit.components.v1 as components
 
 # Streamlit 부분 재실행(Fragment) 데코레이터 호환성 처리
 try:
@@ -46,22 +44,24 @@ def get_raw_xml(element):
     if element is None: return ""
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
+# [개선 1] 하드코딩된 X축 280 대신 동적 page_width를 활용하여 단(Column) 분리
 def merge_multi_page_bboxes(blocks):
     """
     유효한 텍스트 줄(Line)들을 페이지(Page)와 단(Column)을 기준으로 타이트하게 병합.
-    단이 넘어가거나 Y축 갭이 크면 새로운 박스로 분리 생성하여 거대 박스를 방지합니다.
     """
     if not blocks: return []
     merged = []
     
     curr_box = list(blocks[0]["bbox"])
     curr_page = blocks[0]["page"]
-    curr_col = 0 if curr_box[0] < 280 else 1
+    curr_width = blocks[0]["page_width"]
+    curr_col = 0 if curr_box[0] < (curr_width / 2) else 1
     
     for b in blocks[1:]:
         p = b["page"]
         box = b["bbox"]
-        col = 0 if box[0] < 280 else 1
+        w = b["page_width"]
+        col = 0 if box[0] < (w / 2) else 1
         
         y_gap = box[1] - curr_box[3]
         
@@ -90,24 +90,16 @@ def find_best_match(xml_text, pdf_texts):
     return best_match_ratio, str(best_bbox) if best_bbox else "None", best_page
 
 def find_accumulated_match(xml_text, pdf_texts, threshold):
-    """
-    [완전 개선] 기호/공백을 무시한 순수 문자 5글자 탐색(IN 방식)으로 매핑 실패 원천 차단
-    """
     if not xml_text: return 0, "None", -1
-    
     clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
-    
-    # 괄호, 기호, 공백을 모두 제거한 순수 한글/영문/숫자만 추출
     pure_xml_text = re.sub(r'[^\w가-힣]', '', clean_xml)
     xml_prefix = pure_xml_text[:5] if len(pure_xml_text) >= 5 else pure_xml_text
         
     best_match_ratio, best_blocks, best_start_page = 0, [], -1
     
     for i in range(len(pdf_texts)):
-        # PDF 텍스트에서도 순수 문자만 추출하여 비교 (오작동 방지)
         pure_pdf_block = re.sub(r'[^\w가-힣]', '', pdf_texts[i]["text"])
         
-        # startswith 대신 in 을 사용하여 중간에 번호나 기호가 있어도 완벽 탐지
         if not xml_prefix or xml_prefix in pure_pdf_block:
             accumulated_text = ""
             current_lines = []
@@ -123,7 +115,8 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                 current_lines.append({
                     "length": len(line_clean),
                     "bbox": pdf_texts[j]["bbox"],
-                    "page": pdf_texts[j]["page"]
+                    "page": pdf_texts[j]["page"],
+                    "page_width": pdf_texts[j]["page_width"]
                 })
                 
                 ratio = get_similarity(clean_xml, accumulated_text)
@@ -146,7 +139,11 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                         matched_in_line = sum(1 for k in range(current_char_idx, current_char_idx + line_len) if k in matched_indices)
                         
                         if matched_in_line >= max(2, int(line_len * 0.2)) or (line_len < 5 and matched_in_line > 0):
-                            valid_bboxes.append({"page": line_info["page"], "bbox": line_info["bbox"]})
+                            valid_bboxes.append({
+                                "page": line_info["page"], 
+                                "bbox": line_info["bbox"],
+                                "page_width": line_info["page_width"]
+                            })
                             
                         current_char_idx += line_len
                         
@@ -162,6 +159,49 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
         return best_match_ratio, "None", best_start_page if best_start_page != -1 else 0
 
 # ---------------------------------------------------------
+# [개선 3] 캐싱 로직 - 데이터 재추출 방지 (속도 향상)
+# ---------------------------------------------------------
+@st.cache_resource
+def load_pdf_doc(pdf_bytes):
+    return fitz.open(stream=pdf_bytes, filetype="pdf")
+
+@st.cache_data
+def process_pdf(pdf_bytes):
+    """PDF 텍스트 추출 과정을 캐싱하여 Threshold 조절 시 연산량 최소화"""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    extracted_texts = []
+    page_widths = {}
+    
+    for p_num in range(len(doc)):
+        page = doc[p_num]
+        w = page.rect.width
+        page_widths[p_num] = w
+        p_blocks = page.get_text("dict")["blocks"]
+        
+        def get_block_sort_key(block):
+            if "bbox" in block:
+                x0, y0, x1, y1 = block["bbox"]
+                col = 0 if x0 < (w / 2) else 1  # 동적 단 나누기
+                return (col, y0)
+            return (0, 0)
+            
+        p_blocks_sorted = sorted(p_blocks, key=get_block_sort_key)
+        
+        for b in p_blocks_sorted:
+            if "lines" in b:
+                for line in b["lines"]:
+                    line_text = "".join([span["text"] for span in line["spans"]])
+                    line_text_stripped = line_text.strip()
+                    if line_text_stripped.endswith("-"): line_text = line_text_stripped[:-1]
+                    extracted_texts.append({
+                        "page": p_num, 
+                        "text": line_text, 
+                        "bbox": line["bbox"],
+                        "page_width": w
+                    })
+    return extracted_texts, page_widths
+
+# ---------------------------------------------------------
 # 메인 로직
 # ---------------------------------------------------------
 col_up1, col_up2 = st.columns(2)
@@ -172,11 +212,15 @@ with col_up2:
 
 if uploaded_pdf and uploaded_xml:
     try:
-        tree = ET.parse(uploaded_xml)
+        # 파일 Bytes 읽기
+        pdf_bytes = uploaded_pdf.read()
+        xml_bytes = uploaded_xml.read()
+        
+        tree = ET.ElementTree(ET.fromstring(xml_bytes))
         root = tree.getroot()
         parent_map = {c: p for p in root.iter() for c in p}
     except Exception as e:
-        st.error(f"❌ XML 파싱 오류: {e}")
+        st.error(f"❌ 파싱 오류: {e}")
         st.stop()
 
     def should_exclude_body_node(node):
@@ -201,31 +245,12 @@ if uploaded_pdf and uploaded_xml:
             curr = parent_map.get(curr)
         return False
 
-    doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
+    # 리소스 로드 및 텍스트 데이터 캐싱 활용
+    doc = load_pdf_doc(pdf_bytes)
+    extracted_pdf_texts, page_widths = process_pdf(pdf_bytes)
     
-    if "pdf_view_page" not in st.session_state: st.session_state.pdf_view_page = 0
-    
-    # 1. PDF 텍스트 추출 (Line-level)
-    extracted_pdf_texts = []
-    for p_num in range(len(doc)):
-        p_blocks = doc[p_num].get_text("dict")["blocks"]
-        
-        def get_block_sort_key(block):
-            if "bbox" in block:
-                x0, y0, x1, y1 = block["bbox"]
-                col = 0 if x0 < 280 else 1
-                return (col, y0)
-            return (0, 0)
-            
-        p_blocks_sorted = sorted(p_blocks, key=get_block_sort_key)
-        
-        for b in p_blocks_sorted:
-            if "lines" in b:
-                for line in b["lines"]:
-                    line_text = "".join([span["text"] for span in line["spans"]])
-                    line_text_stripped = line_text.strip()
-                    if line_text_stripped.endswith("-"): line_text = line_text_stripped[:-1]
-                    extracted_pdf_texts.append({"page": p_num, "text": line_text, "bbox": line["bbox"]})
+    if "pdf_view_page" not in st.session_state: 
+        st.session_state.pdf_view_page = 0
 
     mapped_data = []
     unmapped_xml_front, unmapped_xml_body, unmapped_xml_back = [], [], []
@@ -279,7 +304,6 @@ if uploaded_pdf and uploaded_xml:
     # ==========================================
     body_node = root.find('.//body')
     if body_node is not None:
-        
         for sec_node in body_node.findall('.//sec'):
             title_node = sec_node.find('title')
             if title_node is not None:
@@ -316,7 +340,6 @@ if uploaded_pdf and uploaded_xml:
     # ==========================================
     ref_start_idx = 0
     for i, item in enumerate(extracted_pdf_texts):
-        # 대소문자 무시, 공백 무시하고 참고문헌 영역 찾기
         c_text = item["text"].replace(" ", "").strip().lower()
         if "참고문헌" in c_text or "references" in c_text:
             ref_start_idx = i; break
@@ -334,7 +357,7 @@ if uploaded_pdf and uploaded_xml:
             elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
 
     # ==========================================
-    # [데이터 정렬 로직 (1단/2단 흐름 반영)]
+    # [데이터 정렬 로직 (동적 페이지 폭 기반)]
     # ==========================================
     df = pd.DataFrame(mapped_data)
     if not df.empty:
@@ -344,19 +367,20 @@ if uploaded_pdf and uploaded_xml:
             try:
                 bbox_data = ast.literal_eval(bbox_str)
                 p, x0, y0, x1, y1 = bbox_data[0]
-                col = 0 if x0 < 280 else 1
+                pw = page_widths.get(p, 595.0) # 기본값 A4
+                col = 0 if x0 < (pw / 2) else 1
                 return p, col, y0
             except: return page, 9999, 9999
 
-        df['sort_page'] = df.apply(lambda x: get_sort_keys(x)[0], axis=1)
-        df['sort_col']  = df.apply(lambda x: get_sort_keys(x)[1], axis=1)
-        df['sort_y0']   = df.apply(lambda x: get_sort_keys(x)[2], axis=1)
+        df['sort_page'] = df.apply(get_sort_keys, axis=1).apply(lambda x: x[0])
+        df['sort_col']  = df.apply(get_sort_keys, axis=1).apply(lambda x: x[1])
+        df['sort_y0']   = df.apply(get_sort_keys, axis=1).apply(lambda x: x[2])
         df = df.sort_values(by=['sort_page', 'sort_col', 'sort_y0']).drop(columns=['sort_page', 'sort_col', 'sort_y0']).reset_index(drop=True)
 
     selected_row_data = None
 
     # ---------------------------------------------------------
-    # 화면 분할 출력
+    # [개선 2] 화면 분할 출력 - 메모리 최적화를 위한 단일 페이지 렌더링
     # ---------------------------------------------------------
     st.markdown("---")
     col_img, col_data = st.columns([5, 5])
@@ -406,52 +430,46 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
-    # [좌측 패널] PDF 시각화 (Fragment 기반 독립 렌더링 & 붉은색 타이트 박스 적용)
+    # [좌측 패널] PDF 시각화 (단일 페이지 렌더링으로 브라우저 메모리 폭주 방지)
     @fragment
     def render_pdf_viewer(doc, selected_row):
         nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
         with nav_col1:
             if st.button("◀ 이전 페이지", use_container_width=True):
-                if st.session_state.pdf_view_page > 0: st.session_state.pdf_view_page -= 1
+                if st.session_state.pdf_view_page > 0: 
+                    st.session_state.pdf_view_page -= 1
         with nav_col3:
             if st.button("다음 페이지 ▶", use_container_width=True):
-                if st.session_state.pdf_view_page < len(doc) - 1: st.session_state.pdf_view_page += 1
+                if st.session_state.pdf_view_page < len(doc) - 1: 
+                    st.session_state.pdf_view_page += 1
         with nav_col2:
-            st.markdown(f"<h4 style='text-align: center; margin-top: 0px;'>📄 PDF 시각화 (Page {st.session_state.pdf_view_page})</h4>", unsafe_allow_html=True)
+            st.markdown(f"<h4 style='text-align: center; margin-top: 0px;'>📄 Page {st.session_state.pdf_view_page + 1} / {len(doc)}</h4>", unsafe_allow_html=True)
             
         st.divider()
         
         with st.container(height=750):
+            view_page = st.session_state.pdf_view_page
             zoom = 2.0  
-            for i in range(len(doc)):
-                st.markdown(f"<div id='pdf_page_{i}'></div>", unsafe_allow_html=True)
-                
-                page = doc[i]
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                
-                if selected_row and selected_row.get('bbox') != "None":
-                    try:
-                        bbox_data = ast.literal_eval(selected_row['bbox'])
-                        draw = ImageDraw.Draw(img)
-                        for b in bbox_data:
-                            if b[0] == i:
-                                scaled_bbox = [c * zoom for c in b[1:]]
-                                draw.rectangle(scaled_bbox, outline="red", width=4)
-                    except Exception:
-                        pass
-                        
-                st.image(img, use_container_width=True)
-                
-            components.html(
-                f"""
-                <script>
-                    var target = window.parent.document.getElementById('pdf_page_{st.session_state.pdf_view_page}');
-                    if (target) {{ target.scrollIntoView({{behavior: 'smooth', block: 'start'}}); }}
-                </script>
-                """, height=0, width=0
-            )
+            
+            # 전체가 아닌 오직 '현재 페이지'만 렌더링하여 메모리와 성능 극대화
+            page = doc[view_page]
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            
+            if selected_row and selected_row.get('bbox') != "None":
+                try:
+                    bbox_data = ast.literal_eval(selected_row['bbox'])
+                    draw = ImageDraw.Draw(img)
+                    for b in bbox_data:
+                        if b[0] == view_page:
+                            scaled_bbox = [c * zoom for c in b[1:]]
+                            draw.rectangle(scaled_bbox, outline="red", width=4)
+                except Exception:
+                    pass
+                    
+            st.image(img, use_container_width=True)
+            # 자바스크립트 자동 스크롤 기능 제거 (단일 페이지 뷰어로 인해 불필요해짐)
 
     with col_img:
         render_pdf_viewer(doc, selected_row_data)
