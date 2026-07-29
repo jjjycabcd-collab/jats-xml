@@ -223,28 +223,54 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
         return False
 
     # -------------------------------------------------------------
-    # [핵심 로직] Body 시작점 탐색 (목차 등 초록 이전 텍스트 무시)
+    # [핵심 로직] Body 시작점 탐색 (목차 등 프론트매터 완벽 필터링)
     # -------------------------------------------------------------
-    body_start_idx = 0
+    abs_page = -1
+    abs_y0 = -1
+    abs_idx = 0
+    
+    # 1. 가장 마지막에 등장하는 요약/초록/Keywords의 위치(page, y0)와 인덱스를 찾음
     for i, item in enumerate(_extracted_pdf_texts):
-        # 초록/키워드는 대개 3페이지 이내에 존재하므로 탐색 범위 제한
-        if item["page"] > 2: 
-            break
+        if item["page"] > 2: break
         c_text = item["text"].replace(" ", "").strip().lower()
         
-        # 키워드를 나타내는 단어로 시작하는 블록을 계속 추적하여 가장 마지막(아래)을 찾음
-        if (c_text.startswith("초록") or c_text.startswith("요약") or 
-            c_text.startswith("주제어") or c_text.startswith("핵심어") or 
-            c_text.startswith("abstract") or c_text.startswith("keyword")):
-            body_start_idx = i
+        is_fm = False
+        for kw in ["초록", "요약", "주제어", "핵심어", "abstract", "keyword"]:
+            # ":" 이나 기호가 붙어 명확한 헤더 역할을 하는 경우
+            if (c_text.startswith(kw + ":") or c_text.startswith(kw + "]") or 
+                c_text.startswith(kw + ">") or c_text.startswith("[" + kw) or 
+                c_text.startswith("<" + kw) or c_text.startswith("【" + kw) or c_text.startswith(kw + "】")):
+                is_fm = True
+                break
+            # 기호가 없더라도 전체 길이가 짧아 독립된 타이틀로 판단되는 경우
+            elif c_text.startswith(kw) and len(c_text) < 20:
+                is_fm = True
+                break
+                
+        if is_fm:
+            abs_page = item["page"]
+            abs_y0 = item["bbox"][1]  # Y좌표(물리적 높이) 기록
+            abs_idx = i               # 순서(인덱스) 기록
             
-    # 본문(Body) 탐색은 해당 인덱스 이후부터만 진행 (목차 필터링)
-    pdf_texts_for_body = _extracted_pdf_texts[body_start_idx:]
+    # 2. 본문(Body) 전용 텍스트 리스트 생성 (목차 부분 완벽 제거)
+    pdf_texts_for_body = []
+    for i, item in enumerate(_extracted_pdf_texts):
+        # 1차 필터링: 요약/초록 이전의 인덱스 무시 (Left-TOC, Title, Authors 등)
+        if i < abs_idx:
+            continue
+            
+        # 2차 필터링(중요): 다단 정렬 때문에 우측 단의 목차(Right-TOC)가 인덱스상 뒤로 밀려 들어온 경우
+        # 요약과 같은 페이지이면서 물리적으로 더 위쪽(y0 < abs_y0)에 있다면 확실히 제외
+        if abs_page != -1 and item["page"] == abs_page:
+            if item["bbox"][1] < abs_y0 - 20:
+                continue 
+                
+        pdf_texts_for_body.append(item)
 
     mapped_data = []
     unmapped_xml_front, unmapped_xml_body, unmapped_xml_back = [], [], []
     
-    # [Front 매핑] (Front는 논문 최상단에 있으므로 전체 _extracted_pdf_texts 사용)
+    # [Front 매핑]
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
@@ -286,7 +312,7 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                 if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
-    # [Body 매핑] (수정된 pdf_texts_for_body 를 사용)
+    # [Body 매핑] - 정제된 pdf_texts_for_body 사용
     body_node = root.find('.//body')
     if body_node is not None:
         for sec_node in body_node.findall('.//sec'):
