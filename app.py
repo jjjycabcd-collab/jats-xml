@@ -193,31 +193,18 @@ def process_pdf(pdf_bytes):
                     })
     return extracted_texts, page_widths
 
-# ---------------------------------------------------------
-# 메인 로직
-# ---------------------------------------------------------
-col_up1, col_up2 = st.columns(2)
-with col_up1:
-    uploaded_pdf = st.file_uploader("PDF 원문 파일을 업로드하세요", type=["pdf"])
-with col_up2:
-    uploaded_xml = st.file_uploader("JATS XML 파일을 업로드하세요", type=["xml"])
-
-# [추가] 각 탭별 이전 선택 상태를 저장하기 위한 세션 스테이트 초기화
-if "prev_sel_f" not in st.session_state: st.session_state.prev_sel_f = []
-if "prev_sel_body" not in st.session_state: st.session_state.prev_sel_body = []
-if "prev_sel_b" not in st.session_state: st.session_state.prev_sel_b = []
-if "active_sel_data" not in st.session_state: st.session_state.active_sel_data = None
-
-if uploaded_pdf and uploaded_xml:
-    try:
-        pdf_bytes = uploaded_pdf.read()
-        xml_bytes = uploaded_xml.read()
-        tree = ET.ElementTree(ET.fromstring(xml_bytes))
-        root = tree.getroot()
-        parent_map = {c: p for p in root.iter() for c in p}
-    except Exception as e:
-        st.error(f"❌ 파싱 오류: {e}")
-        st.stop()
+# =========================================================================
+# [핵심 최적화 부분] 매핑 로직 전체를 함수로 묶어 캐싱
+# 파라미터 앞의 '_' (예: _extracted_pdf_texts)는 Streamlit에게 해싱을 무시하라는 의미입니다.
+# 이렇게 하면 거대한 데이터 리스트를 넘겨도 캐시 로딩 속도가 0.0초대로 처리됩니다.
+# =========================================================================
+@st.cache_data(show_spinner="XML과 PDF 텍스트를 분석하여 매핑 중입니다... (최초 1회만 실행)")
+def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths, 
+                         front_th, body_title_th, body_p_th, body_fig_th, back_th):
+    
+    tree = ET.ElementTree(ET.fromstring(xml_bytes))
+    root = tree.getroot()
+    parent_map = {c: p for p in root.iter() for c in p}
 
     def should_exclude_body_node(node):
         text = extract_xml_text(node).replace(" ", "").replace("\n", "").lower()
@@ -237,16 +224,10 @@ if uploaded_pdf and uploaded_xml:
             curr = parent_map.get(curr)
         return False
 
-    doc = load_pdf_doc(pdf_bytes)
-    extracted_pdf_texts, page_widths = process_pdf(pdf_bytes)
-    
-    if "pdf_view_page" not in st.session_state: 
-        st.session_state.pdf_view_page = 0
-
     mapped_data = []
     unmapped_xml_front, unmapped_xml_body, unmapped_xml_back = [], [], []
     
-    # [Front, Body, Back 매핑 로직은 동일하게 유지]
+    # [Front 매핑]
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
@@ -256,7 +237,7 @@ if uploaded_pdf and uploaded_xml:
                 format1, format2 = given + surname, surname + given
                 
                 best_match_ratio, best_bbox, best_page = 0, "None", -1
-                for pdf_item in extracted_pdf_texts:
+                for pdf_item in _extracted_pdf_texts:
                     max_ratio = max(get_similarity(format1, pdf_item["text"]), get_similarity(format2, pdf_item["text"]))
                     if max_ratio > best_match_ratio:
                         best_match_ratio = max_ratio
@@ -264,30 +245,31 @@ if uploaded_pdf and uploaded_xml:
                         best_page = pdf_item["page"]
                 
                 xml_display_text = f"{given} {surname}".strip()
-                if best_match_ratio >= FRONT_THRESHOLD: mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "page": best_page, "bbox": best_bbox, "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                if best_match_ratio >= front_th: mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "page": best_page, "bbox": best_bbox, "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "page": best_page if best_page != -1 else 0, "bbox": "None", "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(name_node))
 
             for email_node in contrib.findall('.//email'):
                 xml_text = extract_xml_text(email_node)
                 if not xml_text: continue
-                ratio, bbox_str, b_page = find_best_match(xml_text, extracted_pdf_texts)
-                if ratio >= FRONT_THRESHOLD: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                ratio, bbox_str, b_page = find_best_match(xml_text, _extracted_pdf_texts)
+                if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(email_node))
 
             for orcid_node in contrib.findall('.//contrib-id'):
                 if orcid_node.attrib.get('contrib-id-type') == 'orcid' or 'orcid' in extract_xml_text(orcid_node).lower():
                     xml_text = extract_xml_text(orcid_node)
-                    ratio, bbox_str, b_page = find_best_match(xml_text, extracted_pdf_texts)
-                    if ratio >= FRONT_THRESHOLD: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                    ratio, bbox_str, b_page = find_best_match(xml_text, _extracted_pdf_texts)
+                    if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                     else: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(orcid_node))
 
             for role_node in contrib.findall('.//role'):
                 xml_text = extract_xml_text(role_node)
                 if not xml_text: continue
-                ratio, bbox_str, b_page = find_best_match(xml_text, extracted_pdf_texts)
-                if ratio >= FRONT_THRESHOLD: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                ratio, bbox_str, b_page = find_best_match(xml_text, _extracted_pdf_texts)
+                if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
+    # [Body 매핑]
     body_node = root.find('.//body')
     if body_node is not None:
         for sec_node in body_node.findall('.//sec'):
@@ -296,8 +278,8 @@ if uploaded_pdf and uploaded_xml:
                 if should_exclude_body_node(title_node): continue
                 xml_text = extract_xml_text(title_node)
                 if xml_text:
-                    ratio, bbox_str, b_page = find_accumulated_match(xml_text, extracted_pdf_texts, BODY_TITLE_THRESHOLD)
-                    if ratio >= BODY_TITLE_THRESHOLD: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                    ratio, bbox_str, b_page = find_accumulated_match(xml_text, _extracted_pdf_texts, body_title_th)
+                    if ratio >= body_title_th: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                     else: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(title_node))
         
         for fig_table_node in body_node.findall('.//table-wrap') + body_node.findall('.//fig'):
@@ -308,35 +290,37 @@ if uploaded_pdf and uploaded_xml:
             if title_node is None: title_node = fig_table_node.find('.//caption/p')
                 
             xml_text = f"{extract_xml_text(label_node)} {extract_xml_text(title_node)}".strip()
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, extracted_pdf_texts, BODY_FIG_TABLE_THRESHOLD)
-            if ratio >= BODY_FIG_TABLE_THRESHOLD: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+            ratio, bbox_str, b_page = find_accumulated_match(xml_text, _extracted_pdf_texts, body_fig_th)
+            if ratio >= body_fig_th: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(fig_table_node))
 
         for p_node in body_node.findall('.//p'):
             if should_exclude_body_node(p_node): continue
             xml_text = extract_xml_text(p_node)
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, extracted_pdf_texts, BODY_P_THRESHOLD)
-            if ratio >= BODY_P_THRESHOLD: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+            ratio, bbox_str, b_page = find_accumulated_match(xml_text, _extracted_pdf_texts, body_p_th)
+            if ratio >= body_p_th: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(p_node))
 
+    # [Back 매핑]
     ref_start_idx = 0
-    for i, item in enumerate(extracted_pdf_texts):
+    for i, item in enumerate(_extracted_pdf_texts):
         c_text = item["text"].replace(" ", "").strip().lower()
         if "참고문헌" in c_text or "references" in c_text:
             ref_start_idx = i; break
             
-    pdf_texts_for_back = extracted_pdf_texts[ref_start_idx:]
+    pdf_texts_for_back = _extracted_pdf_texts[ref_start_idx:]
     back_node = root.find('.//back')
     if back_node is not None:
         for ref in back_node.findall('.//ref'):
             annotation = ref.find('.//annotation')
             if annotation is None: continue
             xml_text = extract_xml_text(annotation)
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_back, BACK_THRESHOLD)
+            ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_back, back_th)
             
-            if ratio >= BACK_THRESHOLD: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+            if ratio >= back_th: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
 
+    # [정렬 및 DataFrame 반환]
     df = pd.DataFrame(mapped_data)
     if not df.empty:
         def get_sort_keys(row):
@@ -345,7 +329,7 @@ if uploaded_pdf and uploaded_xml:
             try:
                 bbox_data = ast.literal_eval(bbox_str)
                 p, x0, y0, x1, y1 = bbox_data[0]
-                pw = page_widths.get(p, 595.0) 
+                pw = _page_widths.get(p, 595.0) 
                 col = 0 if x0 < (pw / 2) else 1
                 return p, col, y0
             except: return page, 9999, 9999
@@ -354,6 +338,45 @@ if uploaded_pdf and uploaded_xml:
         df['sort_col']  = df.apply(get_sort_keys, axis=1).apply(lambda x: x[1])
         df['sort_y0']   = df.apply(get_sort_keys, axis=1).apply(lambda x: x[2])
         df = df.sort_values(by=['sort_page', 'sort_col', 'sort_y0']).drop(columns=['sort_page', 'sort_col', 'sort_y0']).reset_index(drop=True)
+
+    return df, unmapped_xml_front, unmapped_xml_body, unmapped_xml_back
+
+
+# ---------------------------------------------------------
+# 메인 로직
+# ---------------------------------------------------------
+col_up1, col_up2 = st.columns(2)
+with col_up1:
+    uploaded_pdf = st.file_uploader("PDF 원문 파일을 업로드하세요", type=["pdf"])
+with col_up2:
+    uploaded_xml = st.file_uploader("JATS XML 파일을 업로드하세요", type=["xml"])
+
+# 각 탭별 이전 선택 상태를 저장하기 위한 세션 스테이트 초기화
+if "prev_sel_f" not in st.session_state: st.session_state.prev_sel_f = []
+if "prev_sel_body" not in st.session_state: st.session_state.prev_sel_body = []
+if "prev_sel_b" not in st.session_state: st.session_state.prev_sel_b = []
+if "active_sel_data" not in st.session_state: st.session_state.active_sel_data = None
+
+if uploaded_pdf and uploaded_xml:
+    try:
+        pdf_bytes = uploaded_pdf.read()
+        xml_bytes = uploaded_xml.read()
+    except Exception as e:
+        st.error(f"❌ 파일 읽기 오류: {e}")
+        st.stop()
+
+    doc = load_pdf_doc(pdf_bytes)
+    extracted_pdf_texts, page_widths = process_pdf(pdf_bytes)
+    
+    if "pdf_view_page" not in st.session_state: 
+        st.session_state.pdf_view_page = 0
+
+    # [핵심] 여기서 캐싱된 함수를 호출합니다!
+    # 파일을 다시 올리거나 사이드바 슬라이더(Threshold)를 움직이지 않는 한 연산을 수행하지 않습니다.
+    df, unmapped_xml_front, unmapped_xml_body, unmapped_xml_back = run_mapping_pipeline(
+        xml_bytes, extracted_pdf_texts, page_widths, 
+        FRONT_THRESHOLD, BODY_TITLE_THRESHOLD, BODY_P_THRESHOLD, BODY_FIG_TABLE_THRESHOLD, BACK_THRESHOLD
+    )
 
     # ---------------------------------------------------------
     # 화면 출력 및 "상태 변경 감지" 로직
@@ -366,7 +389,6 @@ if uploaded_pdf and uploaded_xml:
             st.subheader("📊 영역별 매칭 데이터 검수")
             tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (본문)", "Back (참고문헌)"])
             
-            # 이벤트 객체와 데이터프레임 초기화
             event_front, event_body, event_back = None, None, None
             df_front, df_body, df_back = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
             
@@ -386,41 +408,33 @@ if uploaded_pdf and uploaded_xml:
                     df_back = df[df["category"] == "Back"].reset_index(drop=True)
                     event_back = st.dataframe(df_back, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row", key="df_b")
 
-            # [핵심 로직] 각 테이블의 현재 선택된 행 확인
             curr_sel_f = event_front.selection.rows if event_front else []
             curr_sel_body = event_body.selection.rows if event_body else []
             curr_sel_b = event_back.selection.rows if event_back else []
 
             changed = False
             
-            # Front 테이블의 선택 상태가 방금 바뀌었는지 비교
             if curr_sel_f != st.session_state.prev_sel_f:
                 st.session_state.prev_sel_f = curr_sel_f
                 if curr_sel_f:
                     st.session_state.active_sel_data = df_front.iloc[curr_sel_f[0]].to_dict()
                     changed = True
-                else:
-                    st.session_state.active_sel_data = None
+                else: st.session_state.active_sel_data = None
             
-            # Body 테이블의 선택 상태가 방금 바뀌었는지 비교        
             elif curr_sel_body != st.session_state.prev_sel_body:
                 st.session_state.prev_sel_body = curr_sel_body
                 if curr_sel_body:
                     st.session_state.active_sel_data = df_body.iloc[curr_sel_body[0]].to_dict()
                     changed = True
-                else:
-                    st.session_state.active_sel_data = None
+                else: st.session_state.active_sel_data = None
             
-            # Back 테이블의 선택 상태가 방금 바뀌었는지 비교        
             elif curr_sel_b != st.session_state.prev_sel_b:
                 st.session_state.prev_sel_b = curr_sel_b
                 if curr_sel_b:
                     st.session_state.active_sel_data = df_back.iloc[curr_sel_b[0]].to_dict()
                     changed = True
-                else:
-                    st.session_state.active_sel_data = None
+                else: st.session_state.active_sel_data = None
 
-            # 탭에 상관없이 클릭을 통해 '변경'이 발생했다면, 해당 항목의 페이지로 PDF 이동
             if changed and st.session_state.active_sel_data:
                 if st.session_state.active_sel_data.get('bbox') != "None":
                     st.session_state.pdf_view_page = int(st.session_state.active_sel_data['page'])
