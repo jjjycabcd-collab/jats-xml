@@ -281,6 +281,11 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
     # [Front 매핑]
     front_node = root.find('.//front')
     if front_node is not None:
+        
+        # 💡 핵심 개선: Front 영역은 첫 페이지(0)와 마지막 페이지만 탐색 대상으로 제한
+        max_page = _extracted_pdf_texts[-1]["page"] if _extracted_pdf_texts else 0
+        front_target_texts = [item for item in _extracted_pdf_texts if item["page"] in (0, max_page)]
+
         for contrib in front_node.findall('.//contrib'):
             # 1. 저자명 (Name)
             for name_node in contrib.findall('.//name'):
@@ -291,7 +296,9 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                 format2 = f"{surname}{given}".replace(" ", "").lower()
                 
                 best_match_ratio, best_bbox, best_page, best_pdf_text = 0.0, "None", -1, ""
-                for pdf_item in _extracted_pdf_texts:
+                
+                # 전체 PDF가 아닌 제한된 페이지(front_target_texts)에서만 검색
+                for pdf_item in front_target_texts:
                     clean_pdf = pdf_item["text"].replace(" ", "").lower()
                     
                     if format1 in clean_pdf or format2 in clean_pdf:
@@ -318,7 +325,7 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             # 2. 이메일 (Email)
             for email_node in contrib.findall('.//email'):
                 xml_text = extract_xml_text(email_node)
-                ratio, bbox_str, b_page, pdf_text = find_front_entity(xml_text, _extracted_pdf_texts)
+                ratio, bbox_str, b_page, pdf_text = find_front_entity(xml_text, front_target_texts)
                 if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(email_node))
 
@@ -328,14 +335,14 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                     xml_text = extract_xml_text(orcid_node)
                     orcid_num = xml_text.split('/')[-1] if '/' in xml_text else xml_text
                     
-                    ratio, bbox_str, b_page, pdf_text = find_front_entity(orcid_num, _extracted_pdf_texts)
+                    ratio, bbox_str, b_page, pdf_text = find_front_entity(orcid_num, front_target_texts)
                     if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                     else: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(orcid_node))
 
             # 4. 역할 (Role)
             for role_node in contrib.findall('.//role'):
                 xml_text = extract_xml_text(role_node)
-                ratio, bbox_str, b_page, pdf_text = find_front_entity(xml_text, _extracted_pdf_texts)
+                ratio, bbox_str, b_page, pdf_text = find_front_entity(xml_text, front_target_texts)
                 if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
@@ -348,12 +355,12 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             clean_aff_text = full_text.replace(label_text, "", 1).strip() if label_text else full_text
             
             if clean_aff_text:
-                front_pdf_texts = [p for p in _extracted_pdf_texts if p["page"] <= 2]
-                ratio, bbox_str, b_page, pdf_text = find_front_entity(clean_aff_text, front_pdf_texts)
+                # 소속 역시 첫 페이지와 마지막 페이지만 제한 탐색
+                ratio, bbox_str, b_page, pdf_text = find_front_entity(clean_aff_text, front_target_texts)
                 
                 if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "aff", "xml_text": full_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "aff", "xml_text": full_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(aff_node))
-
+                    
     # [Body 매핑]
     body_node = root.find('.//body')
     if body_node is not None:
