@@ -76,29 +76,43 @@ def merge_multi_page_bboxes(blocks):
     merged.append([curr_page] + [round(c, 2) for c in curr_box])
     return merged
 
-def find_best_match(xml_text, pdf_texts):
-    best_match_ratio, best_bbox, best_page = 0, None, -1
+def find_front_entity(xml_text, pdf_texts):
+    if not xml_text: return 0.0, "None", -1, ""
+    clean_xml = xml_text.replace(" ", "").lower()
+    
+    best_match_ratio, best_bbox, best_page, best_pdf_text = 0.0, "None", -1, ""
+    
     for pdf_item in pdf_texts:
-        ratio = get_similarity(xml_text, pdf_item["text"])
+        clean_pdf = pdf_item["text"].replace(" ", "").lower()
+        
+        # 1. 완벽하게 포함되는 경우 (in) -> 블록 전체 반환
+        if clean_xml in clean_pdf:
+            return 1.0, str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]]), pdf_item["page"], pdf_item["text"]
+        
+        # 2. 부분 일치 실패 시 기존 유사도 알고리즘 적용
+        ratio = get_similarity(clean_xml, clean_pdf)
         if ratio > best_match_ratio:
             best_match_ratio = ratio
-            best_bbox = [[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]]
+            best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]])
             best_page = pdf_item["page"]
-    return best_match_ratio, str(best_bbox) if best_bbox else "None", best_page
+            best_pdf_text = pdf_item["text"]
+            
+    return best_match_ratio, best_bbox, best_page, best_pdf_text
 
 def find_accumulated_match(xml_text, pdf_texts, threshold):
-    if not xml_text: return 0, "None", -1
+    if not xml_text: return 0.0, "None", -1, ""
     clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
     pure_xml_text = re.sub(r'[^\w가-힣]', '', clean_xml)
     xml_prefix = pure_xml_text[:5] if len(pure_xml_text) >= 5 else pure_xml_text
         
-    best_match_ratio, best_blocks, best_start_page = 0, [], -1
+    best_match_ratio, best_blocks, best_start_page, best_accumulated_text = 0.0, [], -1, ""
     
     for i in range(len(pdf_texts)):
         pure_pdf_block = re.sub(r'[^\w가-힣]', '', pdf_texts[i]["text"])
         
         if not xml_prefix or xml_prefix in pure_pdf_block:
             accumulated_text = ""
+            raw_accumulated_text = ""
             current_lines = []
             match_page = pdf_texts[i]["page"]
             
@@ -109,6 +123,8 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                 if not line_clean: continue
                 
                 accumulated_text += line_clean
+                raw_accumulated_text += pdf_texts[j]["text"] + " "
+                
                 current_lines.append({
                     "length": len(line_clean),
                     "bbox": pdf_texts[j]["bbox"],
@@ -121,6 +137,7 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                 if ratio > best_match_ratio:
                     best_match_ratio = ratio
                     best_start_page = match_page
+                    best_accumulated_text = raw_accumulated_text.strip()
                     
                     sm = difflib.SequenceMatcher(None, clean_xml, accumulated_text)
                     matched_indices = set()
@@ -151,9 +168,9 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                     
     if best_match_ratio >= threshold:
         merged = merge_multi_page_bboxes(best_blocks)
-        return best_match_ratio, str(merged), best_start_page
+        return best_match_ratio, str(merged), best_start_page, best_accumulated_text
     else:
-        return best_match_ratio, "None", best_start_page if best_start_page != -1 else 0
+        return best_match_ratio, "None", best_start_page if best_start_page != -1 else 0, best_accumulated_text
 
 @st.cache_resource
 def load_pdf_doc(pdf_bytes):
@@ -265,43 +282,77 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
+            # 1. 저자명 (Name)
             for name_node in contrib.findall('.//name'):
                 surname = extract_xml_text(name_node.find('surname'))
                 given = extract_xml_text(name_node.find('given-names'))
-                format1, format2 = given + surname, surname + given
                 
-                best_match_ratio, best_bbox, best_page = 0, "None", -1
+                format1 = f"{given}{surname}".replace(" ", "").lower()
+                format2 = f"{surname}{given}".replace(" ", "").lower()
+                
+                best_match_ratio, best_bbox, best_page, best_pdf_text = 0.0, "None", -1, ""
                 for pdf_item in _extracted_pdf_texts:
-                    max_ratio = max(get_similarity(format1, pdf_item["text"]), get_similarity(format2, pdf_item["text"]))
+                    clean_pdf = pdf_item["text"].replace(" ", "").lower()
+                    
+                    if format1 in clean_pdf or format2 in clean_pdf:
+                        best_match_ratio = 1.0
+                        best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]])
+                        best_page = pdf_item["page"]
+                        best_pdf_text = pdf_item["text"]
+                        break
+                    
+                    max_ratio = max(get_similarity(format1, clean_pdf), get_similarity(format2, clean_pdf))
                     if max_ratio > best_match_ratio:
                         best_match_ratio = max_ratio
                         best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]])
                         best_page = pdf_item["page"]
+                        best_pdf_text = pdf_item["text"]
                 
                 xml_display_text = f"{given} {surname}".strip()
-                if best_match_ratio >= front_th: mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "page": best_page, "bbox": best_bbox, "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-                else: mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "page": best_page if best_page != -1 else 0, "bbox": "None", "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(name_node))
+                if best_match_ratio >= front_th: 
+                    mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "matched_pdf_text": best_pdf_text, "page": best_page, "bbox": best_bbox, "similarity": f"{best_match_ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                else: 
+                    mapped_data.append({"category": "Front", "tag": "name", "xml_text": xml_display_text, "matched_pdf_text": "", "page": best_page if best_page != -1 else 0, "bbox": "None", "similarity": f"{best_match_ratio * 100:.1f}%", "status": "❌ 매핑 실패"})
+                    unmapped_xml_front.append(get_raw_xml(name_node))
 
+            # 2. 이메일 (Email)
             for email_node in contrib.findall('.//email'):
                 xml_text = extract_xml_text(email_node)
-                if not xml_text: continue
-                ratio, bbox_str, b_page = find_best_match(xml_text, _extracted_pdf_texts)
-                if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-                else: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(email_node))
+                ratio, bbox_str, b_page, pdf_text = find_front_entity(xml_text, _extracted_pdf_texts)
+                if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                else: mapped_data.append({"category": "Front", "tag": "email", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(email_node))
 
+            # 3. ORCID (Contrib-id)
             for orcid_node in contrib.findall('.//contrib-id'):
                 if orcid_node.attrib.get('contrib-id-type') == 'orcid' or 'orcid' in extract_xml_text(orcid_node).lower():
                     xml_text = extract_xml_text(orcid_node)
-                    ratio, bbox_str, b_page = find_best_match(xml_text, _extracted_pdf_texts)
-                    if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-                    else: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(orcid_node))
+                    orcid_num = xml_text.split('/')[-1] if '/' in xml_text else xml_text
+                    
+                    ratio, bbox_str, b_page, pdf_text = find_front_entity(orcid_num, _extracted_pdf_texts)
+                    if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                    else: mapped_data.append({"category": "Front", "tag": "orcid", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(orcid_node))
 
+            # 4. 역할 (Role)
             for role_node in contrib.findall('.//role'):
                 xml_text = extract_xml_text(role_node)
-                if not xml_text: continue
-                ratio, bbox_str, b_page = find_best_match(xml_text, _extracted_pdf_texts)
-                if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-                else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
+                ratio, bbox_str, b_page, pdf_text = find_front_entity(xml_text, _extracted_pdf_texts)
+                if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
+
+        # 5. 소속 (Affiliation)
+        for aff_node in front_node.findall('.//aff'):
+            label_node = aff_node.find('label')
+            label_text = extract_xml_text(label_node) if label_node is not None else ""
+            full_text = extract_xml_text(aff_node)
+            
+            clean_aff_text = full_text.replace(label_text, "", 1).strip() if label_text else full_text
+            
+            if clean_aff_text:
+                front_pdf_texts = [p for p in _extracted_pdf_texts if p["page"] <= 2]
+                ratio, bbox_str, b_page, pdf_text = find_front_entity(clean_aff_text, front_pdf_texts)
+                
+                if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "aff", "xml_text": full_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                else: mapped_data.append({"category": "Front", "tag": "aff", "xml_text": full_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(aff_node))
 
     # [Body 매핑]
     body_node = root.find('.//body')
@@ -312,9 +363,9 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                 if should_exclude_body_node(title_node): continue
                 xml_text = extract_xml_text(title_node)
                 if xml_text:
-                    ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_body, body_title_th)
-                    if ratio >= body_title_th: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-                    else: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(title_node))
+                    ratio, bbox_str, b_page, pdf_text = find_accumulated_match(xml_text, pdf_texts_for_body, body_title_th)
+                    if ratio >= body_title_th: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+                    else: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(title_node))
         
         for fig_table_node in body_node.findall('.//table-wrap') + body_node.findall('.//fig'):
             if should_exclude_body_node(fig_table_node): continue
@@ -324,16 +375,16 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             if title_node is None: title_node = fig_table_node.find('.//caption/p')
                 
             xml_text = f"{extract_xml_text(label_node)} {extract_xml_text(title_node)}".strip()
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_body, body_fig_th)
-            if ratio >= body_fig_th: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-            elif xml_text: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(fig_table_node))
+            ratio, bbox_str, b_page, pdf_text = find_accumulated_match(xml_text, pdf_texts_for_body, body_fig_th)
+            if ratio >= body_fig_th: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+            elif xml_text: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(fig_table_node))
 
         for p_node in body_node.findall('.//p'):
             if should_exclude_body_node(p_node): continue
             xml_text = extract_xml_text(p_node)
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_body, body_p_th)
-            if ratio >= body_p_th: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-            elif xml_text: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(p_node))
+            ratio, bbox_str, b_page, pdf_text = find_accumulated_match(xml_text, pdf_texts_for_body, body_p_th)
+            if ratio >= body_p_th: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+            elif xml_text: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(p_node))
 
     # [Back 매핑]
     ref_start_idx = 0
@@ -349,10 +400,10 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             annotation = ref.find('.//annotation')
             if annotation is None: continue
             xml_text = extract_xml_text(annotation)
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_back, back_th)
+            ratio, bbox_str, b_page, pdf_text = find_accumulated_match(xml_text, pdf_texts_for_back, back_th)
             
-            if ratio >= back_th: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
-            elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
+            if ratio >= back_th: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
+            elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
 
     # [정렬 및 DataFrame 반환]
     df = pd.DataFrame(mapped_data)
@@ -488,7 +539,7 @@ if uploaded_pdf and uploaded_xml:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
         # =========================================================================
-        # [신규 추가] AI 학습용 데이터 다운로드 영역 (하단)
+        # AI 학습용 데이터 다운로드 영역 (하단)
         # =========================================================================
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.markdown("### 💾 AI 학습용 데이터 Export")
@@ -514,7 +565,7 @@ if uploaded_pdf and uploaded_xml:
             # JSON 형태로 변환
             export_json = json.dumps(export_list, ensure_ascii=False, indent=4)
             
-            # 다운로드 버튼 생성 (Primary 타입으로 파란색 강조)
+            # 다운로드 버튼 생성
             st.download_button(
                 label="📥 AI 학습용 데이터 다운로드 (.json)",
                 data=export_json,
