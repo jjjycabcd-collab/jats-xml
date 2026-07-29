@@ -6,6 +6,7 @@ import pandas as pd
 import ast
 import difflib
 import re
+import json # Export 시 사용할 json 모듈 추가
 
 # Streamlit 부분 재실행(Fragment) 데코레이터 호환성 처리
 try:
@@ -222,45 +223,35 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             curr = parent_map.get(curr)
         return False
 
-    # -------------------------------------------------------------
-    # [핵심 로직] Body 시작점 탐색 (목차 등 프론트매터 완벽 필터링)
-    # -------------------------------------------------------------
     abs_page = -1
     abs_y0 = -1
     abs_idx = 0
     
-    # 1. 가장 마지막에 등장하는 요약/초록/Keywords의 위치(page, y0)와 인덱스를 찾음
     for i, item in enumerate(_extracted_pdf_texts):
         if item["page"] > 2: break
         c_text = item["text"].replace(" ", "").strip().lower()
         
         is_fm = False
         for kw in ["초록", "요약", "주제어", "핵심어", "abstract", "keyword"]:
-            # ":" 이나 기호가 붙어 명확한 헤더 역할을 하는 경우
             if (c_text.startswith(kw + ":") or c_text.startswith(kw + "]") or 
                 c_text.startswith(kw + ">") or c_text.startswith("[" + kw) or 
                 c_text.startswith("<" + kw) or c_text.startswith("【" + kw) or c_text.startswith(kw + "】")):
                 is_fm = True
                 break
-            # 기호가 없더라도 전체 길이가 짧아 독립된 타이틀로 판단되는 경우
             elif c_text.startswith(kw) and len(c_text) < 20:
                 is_fm = True
                 break
                 
         if is_fm:
             abs_page = item["page"]
-            abs_y0 = item["bbox"][1]  # Y좌표(물리적 높이) 기록
-            abs_idx = i               # 순서(인덱스) 기록
+            abs_y0 = item["bbox"][1] 
+            abs_idx = i              
             
-    # 2. 본문(Body) 전용 텍스트 리스트 생성 (목차 부분 완벽 제거)
     pdf_texts_for_body = []
     for i, item in enumerate(_extracted_pdf_texts):
-        # 1차 필터링: 요약/초록 이전의 인덱스 무시 (Left-TOC, Title, Authors 등)
         if i < abs_idx:
             continue
             
-        # 2차 필터링(중요): 다단 정렬 때문에 우측 단의 목차(Right-TOC)가 인덱스상 뒤로 밀려 들어온 경우
-        # 요약과 같은 페이지이면서 물리적으로 더 위쪽(y0 < abs_y0)에 있다면 확실히 제외
         if abs_page != -1 and item["page"] == abs_page:
             if item["bbox"][1] < abs_y0 - 20:
                 continue 
@@ -312,7 +303,7 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                 if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
-    # [Body 매핑] - 정제된 pdf_texts_for_body 사용
+    # [Body 매핑]
     body_node = root.find('.//body')
     if body_node is not None:
         for sec_node in body_node.findall('.//sec'):
@@ -494,6 +485,45 @@ if uploaded_pdf and uploaded_xml:
             with tab_bk_fail:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
+
+        # =========================================================================
+        # [신규 추가] AI 학습용 데이터 다운로드 영역 (하단)
+        # =========================================================================
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown("### 💾 AI 학습용 데이터 Export")
+        st.markdown("Front, Body, Back 영역 중 **매핑에 성공(✅ 매칭 완료)한 데이터**만 추출합니다.")
+        
+        if not df.empty:
+            # 1. '✅ 매칭 완료' 된 항목만 필터링
+            success_df = df[df["status"] == "✅ 매칭 완료"].copy()
+            
+            export_list = []
+            for _, row in success_df.iterrows():
+                row_dict = row.to_dict()
+                
+                # 2. AI 학습용으로 처리하기 쉽도록 Bounding Box 문자열을 실제 리스트 객체로 변환
+                if row_dict.get('bbox') and row_dict['bbox'] != "None":
+                    try:
+                        row_dict['bbox'] = ast.literal_eval(row_dict['bbox'])
+                    except Exception:
+                        pass
+                        
+                export_list.append(row_dict)
+                
+            # JSON 형태로 변환
+            export_json = json.dumps(export_list, ensure_ascii=False, indent=4)
+            
+            # 다운로드 버튼 생성 (Primary 타입으로 파란색 강조)
+            st.download_button(
+                label="📥 AI 학습용 데이터 다운로드 (.json)",
+                data=export_json,
+                file_name="ai_training_dataset.json",
+                mime="application/json",
+                use_container_width=True,
+                type="primary"
+            )
+        else:
+            st.info("추출할 매핑 데이터가 없습니다.")
 
     # [좌측 패널] PDF 시각화 
     @fragment
