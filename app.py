@@ -49,32 +49,34 @@ def get_raw_xml(element):
 def merge_multi_page_bboxes(blocks):
     """
     유효한 텍스트 줄(Line)들을 페이지(Page)와 단(Column)을 기준으로 타이트하게 병합.
-    [개선] 시작 X좌표(x0)만을 기준으로 단을 명확히 분리하여 1단/2단 오류 원천 차단.
+    단이 넘어가거나 Y축 갭이 크면 새로운 박스로 분리 생성하여 거대 박스를 방지합니다.
     """
     if not blocks: return []
-    groups = {}
-    for b in blocks:
+    merged = []
+    
+    curr_box = list(blocks[0]["bbox"])
+    curr_page = blocks[0]["page"]
+    curr_col = 0 if curr_box[0] < 280 else 1
+    
+    for b in blocks[1:]:
         p = b["page"]
         box = b["bbox"]
-        
-        # 좌측 마진이 280px(A4 절반) 미만이면 무조건 좌측 단(0)으로 할당
         col = 0 if box[0] < 280 else 1
         
-        key = (p, col)
-        if key not in groups:
-            groups[key] = list(box)
-        else:
-            curr = groups[key]
-            curr[0] = min(curr[0], box[0])
-            curr[1] = min(curr[1], box[1])
-            curr[2] = max(curr[2], box[2])
-            curr[3] = max(curr[3], box[3])
-            
-    merged = []
-    for (p, col), box in groups.items():
-        merged.append([p] + [round(c, 2) for c in box])
+        y_gap = box[1] - curr_box[3]
         
-    merged.sort(key=lambda x: (x[0], x[1]))
+        if p == curr_page and col == curr_col and y_gap < 150:
+            curr_box[0] = min(curr_box[0], box[0])
+            curr_box[1] = min(curr_box[1], box[1])
+            curr_box[2] = max(curr_box[2], box[2])
+            curr_box[3] = max(curr_box[3], box[3])
+        else:
+            merged.append([curr_page] + [round(c, 2) for c in curr_box])
+            curr_box = list(box)
+            curr_page = p
+            curr_col = col
+            
+    merged.append([curr_page] + [round(c, 2) for c in curr_box])
     return merged
 
 def find_best_match(xml_text, pdf_texts):
@@ -89,28 +91,30 @@ def find_best_match(xml_text, pdf_texts):
 
 def find_accumulated_match(xml_text, pdf_texts, threshold):
     """
-    [핵심 수정] 1단 레이아웃 문단이 페이지 푸터(Footer)를 넘어가더라도 
-    넉넉한 버퍼를 주어 끊기지 않고 텍스트를 끝까지 추적합니다.
+    [완전 개선] 기호/공백을 무시한 순수 문자 5글자 탐색(IN 방식)으로 매핑 실패 원천 차단
     """
     if not xml_text: return 0, "None", -1
     
     clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
-    clean_xml_for_prefix = re.sub(r'^[^\w가-힣]+', '', clean_xml)
-    xml_prefix = clean_xml_for_prefix[:3] if len(clean_xml_for_prefix) >= 3 else clean_xml_for_prefix
+    
+    # 괄호, 기호, 공백을 모두 제거한 순수 한글/영문/숫자만 추출
+    pure_xml_text = re.sub(r'[^\w가-힣]', '', clean_xml)
+    xml_prefix = pure_xml_text[:5] if len(pure_xml_text) >= 5 else pure_xml_text
         
     best_match_ratio, best_blocks, best_start_page = 0, [], -1
     
     for i in range(len(pdf_texts)):
-        clean_pdf_block = re.sub(r'^[^\w가-힣]+', '', pdf_texts[i]["text"].replace(" ", "").replace("\n", "").strip())
+        # PDF 텍스트에서도 순수 문자만 추출하여 비교 (오작동 방지)
+        pure_pdf_block = re.sub(r'[^\w가-힣]', '', pdf_texts[i]["text"])
         
-        if not xml_prefix or clean_pdf_block.startswith(xml_prefix):
+        # startswith 대신 in 을 사용하여 중간에 번호나 기호가 있어도 완벽 탐지
+        if not xml_prefix or xml_prefix in pure_pdf_block:
             accumulated_text = ""
             current_lines = []
             match_page = pdf_texts[i]["page"]
             
             for j in range(i, len(pdf_texts)):
-                # 중간에 다른 페이지가 끼어들지 않고 연속적인 경우에만 진행
-                if j > i and pdf_texts[j]["page"] - pdf_texts[j-1]["page"] > 1: break 
+                if pdf_texts[j]["page"] - match_page > 1: break 
                 
                 line_clean = pdf_texts[j]["text"].replace(" ", "").replace("\n", "").strip()
                 if not line_clean: continue
@@ -148,7 +152,6 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                         
                     best_blocks = list(valid_bboxes)
                     
-                # [개선] 페이지 푸터 등 엉뚱한 값이 섞여도 최대 400자까지는 점프하며 탐색을 이어감
                 if len(accumulated_text) >= len(clean_xml) + 400: 
                     break
                     
@@ -207,7 +210,6 @@ if uploaded_pdf and uploaded_xml:
     for p_num in range(len(doc)):
         p_blocks = doc[p_num].get_text("dict")["blocks"]
         
-        # [핵심] 읽기 흐름 재정렬 기준 (1단, 2단 혼합 문서 완벽 대응)
         def get_block_sort_key(block):
             if "bbox" in block:
                 x0, y0, x1, y1 = block["bbox"]
@@ -314,7 +316,9 @@ if uploaded_pdf and uploaded_xml:
     # ==========================================
     ref_start_idx = 0
     for i, item in enumerate(extracted_pdf_texts):
-        if item["text"].replace(" ", "").strip() in ["참고문헌", "REFERENCES", "References"]:
+        # 대소문자 무시, 공백 무시하고 참고문헌 영역 찾기
+        c_text = item["text"].replace(" ", "").strip().lower()
+        if "참고문헌" in c_text or "references" in c_text:
             ref_start_idx = i; break
             
     pdf_texts_for_back = extracted_pdf_texts[ref_start_idx:]
@@ -432,10 +436,8 @@ if uploaded_pdf and uploaded_xml:
                         bbox_data = ast.literal_eval(selected_row['bbox'])
                         draw = ImageDraw.Draw(img)
                         for b in bbox_data:
-                            # b 구조: [page, x0, y0, x1, y1]
                             if b[0] == i:
                                 scaled_bbox = [c * zoom for c in b[1:]]
-                                # 붉은색(red) 분할 박스 완벽 적용
                                 draw.rectangle(scaled_bbox, outline="red", width=4)
                     except Exception:
                         pass
