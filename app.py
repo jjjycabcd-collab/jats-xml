@@ -194,9 +194,7 @@ def process_pdf(pdf_bytes):
     return extracted_texts, page_widths
 
 # =========================================================================
-# [핵심 최적화 부분] 매핑 로직 전체를 함수로 묶어 캐싱
-# 파라미터 앞의 '_' (예: _extracted_pdf_texts)는 Streamlit에게 해싱을 무시하라는 의미입니다.
-# 이렇게 하면 거대한 데이터 리스트를 넘겨도 캐시 로딩 속도가 0.0초대로 처리됩니다.
+# 매핑 로직 전체 캐싱 
 # =========================================================================
 @st.cache_data(show_spinner="XML과 PDF 텍스트를 분석하여 매핑 중입니다... (최초 1회만 실행)")
 def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths, 
@@ -224,10 +222,29 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             curr = parent_map.get(curr)
         return False
 
+    # -------------------------------------------------------------
+    # [핵심 로직] Body 시작점 탐색 (목차 등 초록 이전 텍스트 무시)
+    # -------------------------------------------------------------
+    body_start_idx = 0
+    for i, item in enumerate(_extracted_pdf_texts):
+        # 초록/키워드는 대개 3페이지 이내에 존재하므로 탐색 범위 제한
+        if item["page"] > 2: 
+            break
+        c_text = item["text"].replace(" ", "").strip().lower()
+        
+        # 키워드를 나타내는 단어로 시작하는 블록을 계속 추적하여 가장 마지막(아래)을 찾음
+        if (c_text.startswith("초록") or c_text.startswith("요약") or 
+            c_text.startswith("주제어") or c_text.startswith("핵심어") or 
+            c_text.startswith("abstract") or c_text.startswith("keyword")):
+            body_start_idx = i
+            
+    # 본문(Body) 탐색은 해당 인덱스 이후부터만 진행 (목차 필터링)
+    pdf_texts_for_body = _extracted_pdf_texts[body_start_idx:]
+
     mapped_data = []
     unmapped_xml_front, unmapped_xml_body, unmapped_xml_back = [], [], []
     
-    # [Front 매핑]
+    # [Front 매핑] (Front는 논문 최상단에 있으므로 전체 _extracted_pdf_texts 사용)
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
@@ -269,7 +286,7 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                 if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
-    # [Body 매핑]
+    # [Body 매핑] (수정된 pdf_texts_for_body 를 사용)
     body_node = root.find('.//body')
     if body_node is not None:
         for sec_node in body_node.findall('.//sec'):
@@ -278,7 +295,7 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                 if should_exclude_body_node(title_node): continue
                 xml_text = extract_xml_text(title_node)
                 if xml_text:
-                    ratio, bbox_str, b_page = find_accumulated_match(xml_text, _extracted_pdf_texts, body_title_th)
+                    ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_body, body_title_th)
                     if ratio >= body_title_th: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                     else: mapped_data.append({"category": "Body", "tag": "sec/title", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(title_node))
         
@@ -290,14 +307,14 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             if title_node is None: title_node = fig_table_node.find('.//caption/p')
                 
             xml_text = f"{extract_xml_text(label_node)} {extract_xml_text(title_node)}".strip()
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, _extracted_pdf_texts, body_fig_th)
+            ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_body, body_fig_th)
             if ratio >= body_fig_th: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(fig_table_node))
 
         for p_node in body_node.findall('.//p'):
             if should_exclude_body_node(p_node): continue
             xml_text = extract_xml_text(p_node)
-            ratio, bbox_str, b_page = find_accumulated_match(xml_text, _extracted_pdf_texts, body_p_th)
+            ratio, bbox_str, b_page = find_accumulated_match(xml_text, pdf_texts_for_body, body_p_th)
             if ratio >= body_p_th: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(p_node))
 
@@ -351,7 +368,6 @@ with col_up1:
 with col_up2:
     uploaded_xml = st.file_uploader("JATS XML 파일을 업로드하세요", type=["xml"])
 
-# 각 탭별 이전 선택 상태를 저장하기 위한 세션 스테이트 초기화
 if "prev_sel_f" not in st.session_state: st.session_state.prev_sel_f = []
 if "prev_sel_body" not in st.session_state: st.session_state.prev_sel_body = []
 if "prev_sel_b" not in st.session_state: st.session_state.prev_sel_b = []
@@ -371,16 +387,11 @@ if uploaded_pdf and uploaded_xml:
     if "pdf_view_page" not in st.session_state: 
         st.session_state.pdf_view_page = 0
 
-    # [핵심] 여기서 캐싱된 함수를 호출합니다!
-    # 파일을 다시 올리거나 사이드바 슬라이더(Threshold)를 움직이지 않는 한 연산을 수행하지 않습니다.
     df, unmapped_xml_front, unmapped_xml_body, unmapped_xml_back = run_mapping_pipeline(
         xml_bytes, extracted_pdf_texts, page_widths, 
         FRONT_THRESHOLD, BODY_TITLE_THRESHOLD, BODY_P_THRESHOLD, BODY_FIG_TABLE_THRESHOLD, BACK_THRESHOLD
     )
 
-    # ---------------------------------------------------------
-    # 화면 출력 및 "상태 변경 감지" 로직
-    # ---------------------------------------------------------
     st.markdown("---")
     col_img, col_data = st.columns([5, 5])
     
