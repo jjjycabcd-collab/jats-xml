@@ -6,7 +6,7 @@ import pandas as pd
 import ast
 import difflib
 import re
-import json # Export 시 사용할 json 모듈 추가
+import json
 
 # Streamlit 부분 재실행(Fragment) 데코레이터 호환성 처리
 try:
@@ -366,7 +366,8 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
                 pw = _page_widths.get(p, 595.0) 
                 col = 0 if x0 < (pw / 2) else 1
                 return p, col, y0
-            except: return page, 9999, 9999
+            except (ValueError, SyntaxError, IndexError): 
+                return page, 9999, 9999
 
         df['sort_page'] = df.apply(get_sort_keys, axis=1).apply(lambda x: x[0])
         df['sort_col']  = df.apply(get_sort_keys, axis=1).apply(lambda x: x[1])
@@ -505,7 +506,7 @@ if uploaded_pdf and uploaded_xml:
                 if row_dict.get('bbox') and row_dict['bbox'] != "None":
                     try:
                         row_dict['bbox'] = ast.literal_eval(row_dict['bbox'])
-                    except Exception:
+                    except (ValueError, SyntaxError):
                         pass
                         
                 export_list.append(row_dict)
@@ -559,7 +560,7 @@ if uploaded_pdf and uploaded_xml:
                         if b[0] == view_page:
                             scaled_bbox = [c * zoom for c in b[1:]]
                             draw.rectangle(scaled_bbox, outline="red", width=4)
-                except Exception:
+                except (ValueError, SyntaxError, IndexError):
                     pass
                     
             st.image(img, use_container_width=True)
