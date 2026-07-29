@@ -102,15 +102,19 @@ def find_front_entity(xml_text, pdf_texts):
 def find_accumulated_match(xml_text, pdf_texts, threshold):
     if not xml_text: return 0.0, "None", -1, ""
     clean_xml = xml_text.replace(" ", "").replace("\n", "").strip()
-    pure_xml_text = re.sub(r'[^\w가-힣]', '', clean_xml)
-    xml_prefix = pure_xml_text[:5] if len(pure_xml_text) >= 5 else pure_xml_text
+    pure_xml_text = re.sub(r'[^\w가-힣a-zA-Z]', '', clean_xml)
+    if not pure_xml_text: return 0.0, "None", -1, ""
         
+    first_char = pure_xml_text[0]
+    
     best_match_ratio, best_blocks, best_start_page, best_accumulated_text = 0.0, [], -1, ""
     
     for i in range(len(pdf_texts)):
-        pure_pdf_block = re.sub(r'[^\w가-힣]', '', pdf_texts[i]["text"])
+        pure_pdf_block = re.sub(r'[^\w가-힣a-zA-Z]', '', pdf_texts[i]["text"])
+        if not pure_pdf_block: continue
         
-        if not xml_prefix or xml_prefix in pure_pdf_block:
+        # 글자가 하나씩 쪼개진 경우도 탐색을 시작하도록 조건 완화
+        if first_char in pure_pdf_block or pure_pdf_block in pure_xml_text or pure_xml_text in pure_pdf_block:
             accumulated_text = ""
             raw_accumulated_text = ""
             current_lines = []
@@ -142,7 +146,8 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                     sm = difflib.SequenceMatcher(None, clean_xml, accumulated_text)
                     matched_indices = set()
                     for match in sm.get_matching_blocks():
-                        if match.size >= 2: 
+                        # 이름같이 짧은 경우 1글자 매칭도 허용
+                        if match.size >= 2 or len(clean_xml) <= 4: 
                             for idx in range(match.b, match.b + match.size):
                                 matched_indices.add(idx)
                                 
@@ -152,7 +157,7 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                         line_len = line_info["length"]
                         matched_in_line = sum(1 for k in range(current_char_idx, current_char_idx + line_len) if k in matched_indices)
                         
-                        if matched_in_line >= max(2, int(line_len * 0.2)) or (line_len < 5 and matched_in_line > 0):
+                        if matched_in_line >= max(1, int(line_len * 0.2)) or (line_len < 5 and matched_in_line > 0):
                             valid_bboxes.append({
                                 "page": line_info["page"], 
                                 "bbox": line_info["bbox"],
@@ -163,7 +168,7 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                         
                     best_blocks = list(valid_bboxes)
                     
-                if len(accumulated_text) >= len(clean_xml) + 400: 
+                if len(accumulated_text) >= len(clean_xml) + 150: 
                     break
                     
     if best_match_ratio >= threshold:
@@ -282,38 +287,53 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
     front_node = root.find('.//front')
     if front_node is not None:
         
-        # 💡 핵심 개선: Front 영역은 첫 페이지(0)와 마지막 페이지만 탐색 대상으로 제한
+        # 첫 페이지와 마지막 페이지만 Front 탐색 대상으로 제한
         max_page = _extracted_pdf_texts[-1]["page"] if _extracted_pdf_texts else 0
         front_target_texts = [item for item in _extracted_pdf_texts if item["page"] in (0, max_page)]
 
         for contrib in front_node.findall('.//contrib'):
+            
             # 1. 저자명 (Name)
             for name_node in contrib.findall('.//name'):
                 surname = extract_xml_text(name_node.find('surname'))
                 given = extract_xml_text(name_node.find('given-names'))
                 
-                format1 = f"{given}{surname}".replace(" ", "").lower()
-                format2 = f"{surname}{given}".replace(" ", "").lower()
+                # 공백 없는 순수 텍스트 추출
+                pure_surname = re.sub(r'[^\w가-힣a-zA-Z]', '', surname)
+                pure_given = re.sub(r'[^\w가-힣a-zA-Z]', '', given)
+                
+                # 이름+성, 성+이름 조합 생성
+                format1 = pure_given + pure_surname
+                format2 = pure_surname + pure_given
                 
                 best_match_ratio, best_bbox, best_page, best_pdf_text = 0.0, "None", -1, ""
                 
-                # 전체 PDF가 아닌 제한된 페이지(front_target_texts)에서만 검색
+                # 1차 탐색: 같은 블록 안에 완전히 포함되어 있는지 확인
                 for pdf_item in front_target_texts:
-                    clean_pdf = pdf_item["text"].replace(" ", "").lower()
-                    
-                    if format1 in clean_pdf or format2 in clean_pdf:
+                    pure_pdf = re.sub(r'[^\w가-힣a-zA-Z]', '', pdf_item["text"])
+                    if format1 and format1 in pure_pdf:
                         best_match_ratio = 1.0
                         best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]])
                         best_page = pdf_item["page"]
                         best_pdf_text = pdf_item["text"]
                         break
-                    
-                    max_ratio = max(get_similarity(format1, clean_pdf), get_similarity(format2, clean_pdf))
-                    if max_ratio > best_match_ratio:
-                        best_match_ratio = max_ratio
+                    if format2 and format2 in pure_pdf:
+                        best_match_ratio = 1.0
                         best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]])
                         best_page = pdf_item["page"]
                         best_pdf_text = pdf_item["text"]
+                        break
+                
+                # 2차 탐색: 쪼개진 글자(누적 블록)를 대상으로 이름+성, 성+이름 순서로 찾기
+                if best_match_ratio < front_th:
+                    r1, b1, p1, t1 = find_accumulated_match(format1, front_target_texts, front_th)
+                    r2, b2, p2, t2 = find_accumulated_match(format2, front_target_texts, front_th)
+                    
+                    if max(r1, r2) > best_match_ratio:
+                        if r1 >= r2:
+                            best_match_ratio, best_bbox, best_page, best_pdf_text = r1, b1, p1, t1
+                        else:
+                            best_match_ratio, best_bbox, best_page, best_pdf_text = r2, b2, p2, t2
                 
                 xml_display_text = f"{given} {surname}".strip()
                 if best_match_ratio >= front_th: 
@@ -355,12 +375,11 @@ def run_mapping_pipeline(xml_bytes, _extracted_pdf_texts, _page_widths,
             clean_aff_text = full_text.replace(label_text, "", 1).strip() if label_text else full_text
             
             if clean_aff_text:
-                # 소속 역시 첫 페이지와 마지막 페이지만 제한 탐색
                 ratio, bbox_str, b_page, pdf_text = find_front_entity(clean_aff_text, front_target_texts)
                 
                 if ratio >= front_th: mapped_data.append({"category": "Front", "tag": "aff", "xml_text": full_text, "matched_pdf_text": pdf_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "aff", "xml_text": full_text, "matched_pdf_text": "", "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(aff_node))
-                    
+
     # [Body 매핑]
     body_node = root.find('.//body')
     if body_node is not None:
