@@ -44,11 +44,7 @@ def get_raw_xml(element):
     if element is None: return ""
     return ET.tostring(element, encoding='utf-8', method='xml').decode('utf-8')
 
-# [개선 1] 하드코딩된 X축 280 대신 동적 page_width를 활용하여 단(Column) 분리
 def merge_multi_page_bboxes(blocks):
-    """
-    유효한 텍스트 줄(Line)들을 페이지(Page)와 단(Column)을 기준으로 타이트하게 병합.
-    """
     if not blocks: return []
     merged = []
     
@@ -158,16 +154,12 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
     else:
         return best_match_ratio, "None", best_start_page if best_start_page != -1 else 0
 
-# ---------------------------------------------------------
-# [개선 3] 캐싱 로직 - 데이터 재추출 방지 (속도 향상)
-# ---------------------------------------------------------
 @st.cache_resource
 def load_pdf_doc(pdf_bytes):
     return fitz.open(stream=pdf_bytes, filetype="pdf")
 
 @st.cache_data
 def process_pdf(pdf_bytes):
-    """PDF 텍스트 추출 과정을 캐싱하여 Threshold 조절 시 연산량 최소화"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     extracted_texts = []
     page_widths = {}
@@ -181,7 +173,7 @@ def process_pdf(pdf_bytes):
         def get_block_sort_key(block):
             if "bbox" in block:
                 x0, y0, x1, y1 = block["bbox"]
-                col = 0 if x0 < (w / 2) else 1  # 동적 단 나누기
+                col = 0 if x0 < (w / 2) else 1 
                 return (col, y0)
             return (0, 0)
             
@@ -210,12 +202,16 @@ with col_up1:
 with col_up2:
     uploaded_xml = st.file_uploader("JATS XML 파일을 업로드하세요", type=["xml"])
 
+# [추가] 각 탭별 이전 선택 상태를 저장하기 위한 세션 스테이트 초기화
+if "prev_sel_f" not in st.session_state: st.session_state.prev_sel_f = []
+if "prev_sel_body" not in st.session_state: st.session_state.prev_sel_body = []
+if "prev_sel_b" not in st.session_state: st.session_state.prev_sel_b = []
+if "active_sel_data" not in st.session_state: st.session_state.active_sel_data = None
+
 if uploaded_pdf and uploaded_xml:
     try:
-        # 파일 Bytes 읽기
         pdf_bytes = uploaded_pdf.read()
         xml_bytes = uploaded_xml.read()
-        
         tree = ET.ElementTree(ET.fromstring(xml_bytes))
         root = tree.getroot()
         parent_map = {c: p for p in root.iter() for c in p}
@@ -226,14 +222,10 @@ if uploaded_pdf and uploaded_xml:
     def should_exclude_body_node(node):
         text = extract_xml_text(node).replace(" ", "").replace("\n", "").lower()
         if not text: return False
-        
         prefix_exclusions = ["keyword", "keywords", "핵심어", "주제어", "핵심주제어"]
         if any(text.startswith(p) for p in prefix_exclusions): return True
-            
         exact_abstract_titles = ["요약", "국문요약", "영문요약", "초록", "국문초록", "영문초록", "abstract"]
-        if node.tag == 'title':
-            if text.strip("1234567890.ivx()[]<>- ") in exact_abstract_titles: return True
-                
+        if node.tag == 'title' and text.strip("1234567890.ivx()[]<>- ") in exact_abstract_titles: return True
         curr = node
         while curr is not None:
             if curr.tag in ['abstract', 'kwd-group', 'kwd']: return True
@@ -245,7 +237,6 @@ if uploaded_pdf and uploaded_xml:
             curr = parent_map.get(curr)
         return False
 
-    # 리소스 로드 및 텍스트 데이터 캐싱 활용
     doc = load_pdf_doc(pdf_bytes)
     extracted_pdf_texts, page_widths = process_pdf(pdf_bytes)
     
@@ -255,9 +246,7 @@ if uploaded_pdf and uploaded_xml:
     mapped_data = []
     unmapped_xml_front, unmapped_xml_body, unmapped_xml_back = [], [], []
     
-    # ==========================================
-    # [Front - 저자 정보 상세 매칭]
-    # ==========================================
+    # [Front, Body, Back 매핑 로직은 동일하게 유지]
     front_node = root.find('.//front')
     if front_node is not None:
         for contrib in front_node.findall('.//contrib'):
@@ -299,9 +288,6 @@ if uploaded_pdf and uploaded_xml:
                 if ratio >= FRONT_THRESHOLD: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
                 else: mapped_data.append({"category": "Front", "tag": "role", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_front.append(get_raw_xml(role_node))
 
-    # ==========================================
-    # [Body - 본문 제목, 표, 그림, 단락 매칭]
-    # ==========================================
     body_node = root.find('.//body')
     if body_node is not None:
         for sec_node in body_node.findall('.//sec'):
@@ -323,7 +309,6 @@ if uploaded_pdf and uploaded_xml:
                 
             xml_text = f"{extract_xml_text(label_node)} {extract_xml_text(title_node)}".strip()
             ratio, bbox_str, b_page = find_accumulated_match(xml_text, extracted_pdf_texts, BODY_FIG_TABLE_THRESHOLD)
-            
             if ratio >= BODY_FIG_TABLE_THRESHOLD: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Body", "tag": tag_name, "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(fig_table_node))
 
@@ -331,13 +316,9 @@ if uploaded_pdf and uploaded_xml:
             if should_exclude_body_node(p_node): continue
             xml_text = extract_xml_text(p_node)
             ratio, bbox_str, b_page = find_accumulated_match(xml_text, extracted_pdf_texts, BODY_P_THRESHOLD)
-            
             if ratio >= BODY_P_THRESHOLD: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Body", "tag": "p", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_body.append(get_raw_xml(p_node))
 
-    # ==========================================
-    # [Back - 참고문헌 매칭]
-    # ==========================================
     ref_start_idx = 0
     for i, item in enumerate(extracted_pdf_texts):
         c_text = item["text"].replace(" ", "").strip().lower()
@@ -356,9 +337,6 @@ if uploaded_pdf and uploaded_xml:
             if ratio >= BACK_THRESHOLD: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page, "bbox": bbox_str, "similarity": f"{ratio * 100:.1f}%", "status": "✅ 매칭 완료"})
             elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
 
-    # ==========================================
-    # [데이터 정렬 로직 (동적 페이지 폭 기반)]
-    # ==========================================
     df = pd.DataFrame(mapped_data)
     if not df.empty:
         def get_sort_keys(row):
@@ -367,7 +345,7 @@ if uploaded_pdf and uploaded_xml:
             try:
                 bbox_data = ast.literal_eval(bbox_str)
                 p, x0, y0, x1, y1 = bbox_data[0]
-                pw = page_widths.get(p, 595.0) # 기본값 A4
+                pw = page_widths.get(p, 595.0) 
                 col = 0 if x0 < (pw / 2) else 1
                 return p, col, y0
             except: return page, 9999, 9999
@@ -377,10 +355,8 @@ if uploaded_pdf and uploaded_xml:
         df['sort_y0']   = df.apply(get_sort_keys, axis=1).apply(lambda x: x[2])
         df = df.sort_values(by=['sort_page', 'sort_col', 'sort_y0']).drop(columns=['sort_page', 'sort_col', 'sort_y0']).reset_index(drop=True)
 
-    selected_row_data = None
-
     # ---------------------------------------------------------
-    # [개선 2] 화면 분할 출력 - 메모리 최적화를 위한 단일 페이지 렌더링
+    # 화면 출력 및 "상태 변경 감지" 로직
     # ---------------------------------------------------------
     st.markdown("---")
     col_img, col_data = st.columns([5, 5])
@@ -390,28 +366,66 @@ if uploaded_pdf and uploaded_xml:
             st.subheader("📊 영역별 매칭 데이터 검수")
             tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (본문)", "Back (참고문헌)"])
             
+            # 이벤트 객체와 데이터프레임 초기화
+            event_front, event_body, event_back = None, None, None
+            df_front, df_body, df_back = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+            
             with tab_front:
                 if not df.empty and "Front" in df["category"].values:
                     df_front = df[df["category"] == "Front"].reset_index(drop=True)
                     event_front = st.dataframe(df_front, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row", key="df_f")
-                    if len(event_front.selection.rows) > 0:
-                        selected_row_data = df_front.iloc[event_front.selection.rows[0]].to_dict()
-                        if selected_row_data['bbox'] != "None": st.session_state.pdf_view_page = int(selected_row_data['page'])
+            
             with tab_body:
                 if not df.empty and "Body" in df["category"].values:
                     df_body = df[df["category"] == "Body"].reset_index(drop=True)
                     event_body = st.dataframe(df_body, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row", key="df_body_tab")
-                    if len(event_body.selection.rows) > 0 and selected_row_data is None:
-                        selected_row_data = df_body.iloc[event_body.selection.rows[0]].to_dict()
-                        if selected_row_data['bbox'] != "None": st.session_state.pdf_view_page = int(selected_row_data['page'])
                 else: st.info("매핑된 Body 데이터가 없습니다.")
+            
             with tab_back:
                 if not df.empty and "Back" in df["category"].values:
                     df_back = df[df["category"] == "Back"].reset_index(drop=True)
                     event_back = st.dataframe(df_back, use_container_width=True, height=250, on_select="rerun", selection_mode="single-row", key="df_b")
-                    if len(event_back.selection.rows) > 0 and selected_row_data is None:
-                        selected_row_data = df_back.iloc[event_back.selection.rows[0]].to_dict()
-                        if selected_row_data['bbox'] != "None": st.session_state.pdf_view_page = int(selected_row_data['page'])
+
+            # [핵심 로직] 각 테이블의 현재 선택된 행 확인
+            curr_sel_f = event_front.selection.rows if event_front else []
+            curr_sel_body = event_body.selection.rows if event_body else []
+            curr_sel_b = event_back.selection.rows if event_back else []
+
+            changed = False
+            
+            # Front 테이블의 선택 상태가 방금 바뀌었는지 비교
+            if curr_sel_f != st.session_state.prev_sel_f:
+                st.session_state.prev_sel_f = curr_sel_f
+                if curr_sel_f:
+                    st.session_state.active_sel_data = df_front.iloc[curr_sel_f[0]].to_dict()
+                    changed = True
+                else:
+                    st.session_state.active_sel_data = None
+            
+            # Body 테이블의 선택 상태가 방금 바뀌었는지 비교        
+            elif curr_sel_body != st.session_state.prev_sel_body:
+                st.session_state.prev_sel_body = curr_sel_body
+                if curr_sel_body:
+                    st.session_state.active_sel_data = df_body.iloc[curr_sel_body[0]].to_dict()
+                    changed = True
+                else:
+                    st.session_state.active_sel_data = None
+            
+            # Back 테이블의 선택 상태가 방금 바뀌었는지 비교        
+            elif curr_sel_b != st.session_state.prev_sel_b:
+                st.session_state.prev_sel_b = curr_sel_b
+                if curr_sel_b:
+                    st.session_state.active_sel_data = df_back.iloc[curr_sel_b[0]].to_dict()
+                    changed = True
+                else:
+                    st.session_state.active_sel_data = None
+
+            # 탭에 상관없이 클릭을 통해 '변경'이 발생했다면, 해당 항목의 페이지로 PDF 이동
+            if changed and st.session_state.active_sel_data:
+                if st.session_state.active_sel_data.get('bbox') != "None":
+                    st.session_state.pdf_view_page = int(st.session_state.active_sel_data['page'])
+
+            selected_row_data = st.session_state.active_sel_data
                 
             st.markdown("<br>##### 📌 선택된 추출 정보 전체 데이터", unsafe_allow_html=True)
             with st.container(height=200):
@@ -430,7 +444,7 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
-    # [좌측 패널] PDF 시각화 (단일 페이지 렌더링으로 브라우저 메모리 폭주 방지)
+    # [좌측 패널] PDF 시각화 
     @fragment
     def render_pdf_viewer(doc, selected_row):
         nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
@@ -451,7 +465,6 @@ if uploaded_pdf and uploaded_xml:
             view_page = st.session_state.pdf_view_page
             zoom = 2.0  
             
-            # 전체가 아닌 오직 '현재 페이지'만 렌더링하여 메모리와 성능 극대화
             page = doc[view_page]
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat)
@@ -469,7 +482,6 @@ if uploaded_pdf and uploaded_xml:
                     pass
                     
             st.image(img, use_container_width=True)
-            # 자바스크립트 자동 스크롤 기능 제거 (단일 페이지 뷰어로 인해 불필요해짐)
 
     with col_img:
         render_pdf_viewer(doc, selected_row_data)
