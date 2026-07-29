@@ -93,7 +93,7 @@ def find_front_entity(xml_text, pdf_texts):
         ratio = get_similarity(clean_xml, clean_pdf)
         if ratio > best_match_ratio:
             best_match_ratio = ratio
-            best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]]),
+            best_bbox = str([[pdf_item["page"]] + [round(c, 2) for c in pdf_item["bbox"]]])
             best_page = pdf_item["page"]
             best_pdf_text = pdf_item["text"]
             
@@ -217,24 +217,27 @@ def process_pdf(pdf_bytes):
     return extracted_texts, page_widths
 
 # =========================================================================
-# [추가] 시각화(Bounding Box)가 적용된 PDF 생성 함수
+# [신규 추가] 시각화(Bounding Box)가 적용된 PDF 생성 함수
 # =========================================================================
 @st.cache_data(show_spinner=False)
 def create_annotated_pdf(pdf_bytes, mapped_data_df):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
     for _, row in mapped_data_df.iterrows():
-        if row.get("status") == "✅ 매칭 완료" and row.get("bbox") and row["bbox"] != "None":
+        # bbox 데이터가 존재하는 매핑 완료 행만 처리
+        if row.get("status") == "✅ 매칭 완료" and "bbox" in row and pd.notna(row["bbox"]) and row["bbox"] != "None":
             try:
-                bboxes = ast.literal_eval(row["bbox"])
+                # 문자열이면 리스트로 변환, 이미 리스트면 그대로 사용
+                bbox_val = row["bbox"]
+                bboxes = ast.literal_eval(bbox_val) if isinstance(bbox_val, str) else bbox_val
+                
                 for b in bboxes:
-                    page_num = b[0]
-                    # fitz.Rect(x0, y0, x1, y1)
+                    page_num = int(b[0])
                     rect = fitz.Rect(b[1], b[2], b[3], b[4])
                     page = doc[page_num]
                     # PDF 페이지 위에 빨간색 외곽선 그리기
                     page.draw_rect(rect, color=(1, 0, 0), width=1.5)
-            except (ValueError, SyntaxError, IndexError):
+            except Exception:
                 pass
                 
     return doc.tobytes()
@@ -517,21 +520,25 @@ if uploaded_pdf and uploaded_xml:
         with st.container(height=850):
             
             # =========================================================================
-            # [추가된 영역] 제목 옆 우측(파란박스 위치)에 PDF 다운로드 버튼 배치
+            # [추가된 영역] 매핑 정보 목록 제목 및 PDF 다운로드 버튼 배치
             # =========================================================================
             header_col1, header_col2 = st.columns([7, 3], vertical_alignment="bottom")
             with header_col1:
-                st.subheader("📊 영역별 매칭 데이터 검수")
+                st.subheader("📌 매핑된 정보 목록")
+                st.markdown("<p style='color:gray; font-size:14px;'>아래 목록을 클릭하면 좌측 PDF에 해당 영역이 표시됩니다.</p>", unsafe_allow_html=True)
             with header_col2:
                 if not df.empty:
                     annotated_pdf_bytes = create_annotated_pdf(pdf_bytes, df)
                     st.download_button(
-                        label="📥 매핑 결과 PDF 다운로드",
+                        label="📥 PDF 다운로드",
                         data=annotated_pdf_bytes,
                         file_name="annotated_document.pdf",
                         mime="application/pdf",
-                        use_container_width=True
+                        use_container_width=True,
+                        type="primary"
                     )
+            
+            st.write("") # 간격 띄우기
             
             tab_front, tab_body, tab_back = st.tabs(["Front (저자 정보)", "Body (본문)", "Back (참고문헌)"])
             
