@@ -49,40 +49,32 @@ def get_raw_xml(element):
 def merge_multi_page_bboxes(blocks):
     """
     유효한 텍스트 줄(Line)들을 페이지(Page)와 단(Column)을 기준으로 타이트하게 병합.
-    단이 넘어가거나 갭(gap)이 너무 크면 새로운 박스로 분리 생성.
+    [개선] 시작 X좌표(x0)만을 기준으로 단을 명확히 분리하여 1단/2단 오류 원천 차단.
     """
     if not blocks: return []
-    merged = []
-    
-    curr_box = list(blocks[0]["bbox"])
-    curr_page = blocks[0]["page"]
-    
-    def get_col(x0, x1):
-        return 0 if (x0 + x1) / 2 < 300 else 1
-        
-    curr_col = get_col(curr_box[0], curr_box[2])
-    
-    for b in blocks[1:]:
+    groups = {}
+    for b in blocks:
         p = b["page"]
         box = b["bbox"]
-        col = get_col(box[0], box[2])
         
-        y_gap = box[1] - curr_box[3]
+        # 좌측 마진이 280px(A4 절반) 미만이면 무조건 좌측 단(0)으로 할당
+        col = 0 if box[0] < 280 else 1
         
-        # 같은 페이지, 같은 단, Y축 갭이 너무 크지 않은 경우에만 박스 병합
-        if p == curr_page and col == curr_col and y_gap < 200:
-            curr_box[0] = min(curr_box[0], box[0])
-            curr_box[1] = min(curr_box[1], box[1])
-            curr_box[2] = max(curr_box[2], box[2])
-            curr_box[3] = max(curr_box[3], box[3])
+        key = (p, col)
+        if key not in groups:
+            groups[key] = list(box)
         else:
-            # 단이 바뀌거나 페이지가 넘어가면 박스를 닫고 새로 시작
-            merged.append([curr_page] + [round(c, 2) for c in curr_box])
-            curr_box = list(box)
-            curr_page = p
-            curr_col = col
+            curr = groups[key]
+            curr[0] = min(curr[0], box[0])
+            curr[1] = min(curr[1], box[1])
+            curr[2] = max(curr[2], box[2])
+            curr[3] = max(curr[3], box[3])
             
-    merged.append([curr_page] + [round(c, 2) for c in curr_box])
+    merged = []
+    for (p, col), box in groups.items():
+        merged.append([p] + [round(c, 2) for c in box])
+        
+    merged.sort(key=lambda x: (x[0], x[1]))
     return merged
 
 def find_best_match(xml_text, pdf_texts):
@@ -97,7 +89,8 @@ def find_best_match(xml_text, pdf_texts):
 
 def find_accumulated_match(xml_text, pdf_texts, threshold):
     """
-    [핵심 수정] 단락 중간에 푸터나 표가 끼어있더라도 무시하고 우측 단(Column)까지 연결하는 로직
+    [핵심 수정] 1단 레이아웃 문단이 페이지 푸터(Footer)를 넘어가더라도 
+    넉넉한 버퍼를 주어 끊기지 않고 텍스트를 끝까지 추적합니다.
     """
     if not xml_text: return 0, "None", -1
     
@@ -116,7 +109,8 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
             match_page = pdf_texts[i]["page"]
             
             for j in range(i, len(pdf_texts)):
-                if pdf_texts[j]["page"] - match_page > 1: break # 너무 먼 페이지는 중단
+                # 중간에 다른 페이지가 끼어들지 않고 연속적인 경우에만 진행
+                if j > i and pdf_texts[j]["page"] - pdf_texts[j-1]["page"] > 1: break 
                 
                 line_clean = pdf_texts[j]["text"].replace(" ", "").replace("\n", "").strip()
                 if not line_clean: continue
@@ -134,11 +128,10 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                     best_match_ratio = ratio
                     best_start_page = match_page
                     
-                    # 일치하는 텍스트 위치 추적하여 유효한 줄(Line)만 남김
                     sm = difflib.SequenceMatcher(None, clean_xml, accumulated_text)
                     matched_indices = set()
                     for match in sm.get_matching_blocks():
-                        if match.size >= 2: # 짧은 파편 텍스트도 인식하도록 기준 하향
+                        if match.size >= 2: 
                             for idx in range(match.b, match.b + match.size):
                                 matched_indices.add(idx)
                                 
@@ -148,7 +141,6 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                         line_len = line_info["length"]
                         matched_in_line = sum(1 for k in range(current_char_idx, current_char_idx + line_len) if k in matched_indices)
                         
-                        # 푸터나 표(가짜 텍스트)를 거르고 실제 단락 텍스트만 포함
                         if matched_in_line >= max(2, int(line_len * 0.2)) or (line_len < 5 and matched_in_line > 0):
                             valid_bboxes.append({"page": line_info["page"], "bbox": line_info["bbox"]})
                             
@@ -156,8 +148,8 @@ def find_accumulated_match(xml_text, pdf_texts, threshold):
                         
                     best_blocks = list(valid_bboxes)
                     
-                # [수정포인트] 중간에 쓰레기값이 들어가도 200자까지는 더 찾아보도록 버퍼 제공
-                if len(accumulated_text) >= len(clean_xml) + 200: 
+                # [개선] 페이지 푸터 등 엉뚱한 값이 섞여도 최대 400자까지는 점프하며 탐색을 이어감
+                if len(accumulated_text) >= len(clean_xml) + 400: 
                     break
                     
     if best_match_ratio >= threshold:
@@ -215,10 +207,11 @@ if uploaded_pdf and uploaded_xml:
     for p_num in range(len(doc)):
         p_blocks = doc[p_num].get_text("dict")["blocks"]
         
+        # [핵심] 읽기 흐름 재정렬 기준 (1단, 2단 혼합 문서 완벽 대응)
         def get_block_sort_key(block):
             if "bbox" in block:
                 x0, y0, x1, y1 = block["bbox"]
-                col = 0 if x0 < 300 else 1
+                col = 0 if x0 < 280 else 1
                 return (col, y0)
             return (0, 0)
             
@@ -337,7 +330,7 @@ if uploaded_pdf and uploaded_xml:
             elif xml_text: mapped_data.append({"category": "Back", "tag": "annotation", "xml_text": xml_text, "page": b_page if b_page != -1 else 0, "bbox": "None", "similarity": f"{ratio * 100:.1f}%", "status": "❌ 매핑 실패"}); unmapped_xml_back.append(get_raw_xml(ref))
 
     # ==========================================
-    # [데이터 정렬 로직]
+    # [데이터 정렬 로직 (1단/2단 흐름 반영)]
     # ==========================================
     df = pd.DataFrame(mapped_data)
     if not df.empty:
@@ -347,8 +340,7 @@ if uploaded_pdf and uploaded_xml:
             try:
                 bbox_data = ast.literal_eval(bbox_str)
                 p, x0, y0, x1, y1 = bbox_data[0]
-                width = x1 - x0
-                col = 0 if width > 250 or x0 < 300 else 1
+                col = 0 if x0 < 280 else 1
                 return p, col, y0
             except: return page, 9999, 9999
 
@@ -410,7 +402,7 @@ if uploaded_pdf and uploaded_xml:
                 if unmapped_xml_back:
                     for raw in unmapped_xml_back: st.code(raw, language="xml")
 
-    # [좌측 패널] PDF 시각화 (붉은색 타이트 박스 적용)
+    # [좌측 패널] PDF 시각화 (Fragment 기반 독립 렌더링 & 붉은색 타이트 박스 적용)
     @fragment
     def render_pdf_viewer(doc, selected_row):
         nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
@@ -440,10 +432,11 @@ if uploaded_pdf and uploaded_xml:
                         bbox_data = ast.literal_eval(selected_row['bbox'])
                         draw = ImageDraw.Draw(img)
                         for b in bbox_data:
+                            # b 구조: [page, x0, y0, x1, y1]
                             if b[0] == i:
                                 scaled_bbox = [c * zoom for c in b[1:]]
-                                # 요청하신 붉은색(red) 2개의 박스로 명확하게 그려냅니다.
-                                draw.rectangle(scaled_bbox, outline="red", width=3)
+                                # 붉은색(red) 분할 박스 완벽 적용
+                                draw.rectangle(scaled_bbox, outline="red", width=4)
                     except Exception:
                         pass
                         
